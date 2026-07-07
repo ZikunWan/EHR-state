@@ -6,8 +6,8 @@ wandb/
 __pycache__/
 *.py[cod]
 *.so
-data
+data/
 .DS_Store
-outdated
+outdated/
 ds_config_zero2.json
-ds_config_zero3.json
+figures/

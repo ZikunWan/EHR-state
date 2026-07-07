@@ -19,8 +19,8 @@ from transformers import HfArgumentParser
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from pretraining import phenotype_metric_learning as pml
-from pretraining import task_query_classification as tqc
+from outdated import phenotype_metric_learning as pml
+from outdated import task_query_classification as tqc
 
 from utils.collate import build_table_token_tensors
 
@@ -60,7 +60,7 @@ class CacheBuildArguments:
     eicu_processed_dir: str = field(
         default="/data/zikun_workspace/eicu-crd/processed"
     )
-    ehrshot_root_dir: str = field(default="/data/EHR_data_public/EHRSHOT")
+    ehrshot_root_dir: str = field(default="/data/zikun_workspace/input/tables/ehrshot")
     table_text_embedding: List[str] = field(
         default_factory=lambda: [
             "/data/zikun_workspace/.cache/embeddings/mimic_iv/"
@@ -83,10 +83,10 @@ class CacheBuildArguments:
         default="/data/zikun_workspace/code/data/type_vocab.json"
     )
     task_train_sample_info_path: str = field(
-        default="/data/zikun_workspace/mimic-iv-3.1_tabular/task_index/train"
+        default="/data/zikun_workspace/input/tasks/classification/mimic_iv/index/train"
     )
     task_val_sample_info_path: str = field(
-        default="/data/zikun_workspace/mimic-iv-3.1_tabular/task_index/val"
+        default="/data/zikun_workspace/input/tasks/classification/mimic_iv/index/val"
     )
     eicu_task_train_sample_info_path: str = field(
         default="/data/zikun_workspace/eicu-crd/processed/sample_info_train.json"
@@ -95,16 +95,16 @@ class CacheBuildArguments:
         default="/data/zikun_workspace/eicu-crd/processed/sample_info_val.json"
     )
     ehrshot_task_train_sample_info_path: str = field(
-        default="/data/EHR_data_public/EHRSHOT/index/ehrshot_train.csv"
+        default="/data/zikun_workspace/input/tasks/classification/ehrshot/indices/ehrshot_train.csv"
     )
     ehrshot_task_val_sample_info_path: str = field(
-        default="/data/EHR_data_public/EHRSHOT/index/ehrshot_val.csv"
+        default="/data/zikun_workspace/input/tasks/classification/ehrshot/indices/ehrshot_val.csv"
     )
     pretraining_sample_info_path: str = field(
-        default="/data/zikun_workspace/mimic-iv-3.1_tabular/task_index/train/next_token_prediction.csv"
+        default="/data/zikun_workspace/input/tasks/classification/mimic_iv/index/train/next_token_prediction.csv"
     )
     pretraining_val_sample_info_path: str = field(
-        default="/data/zikun_workspace/mimic-iv-3.1_tabular/task_index/val/next_token_prediction.csv"
+        default="/data/zikun_workspace/input/tasks/classification/mimic_iv/index/val/next_token_prediction.csv"
     )
     eicu_pretraining_sample_info_path: str = field(
         default="/data/zikun_workspace/eicu-crd/processed/pretraining_index/sample_info_train.json"
@@ -113,13 +113,13 @@ class CacheBuildArguments:
         default="/data/zikun_workspace/eicu-crd/processed/pretraining_index/sample_info_val.json"
     )
     ehrshot_pretraining_sample_info_path: str = field(
-        default="/data/EHR_data_public/EHRSHOT/pretraining_index/sample_info_train.csv"
+        default="/data/zikun_workspace/input/tables/ehrshot/pretraining_index/sample_info_train.csv"
     )
     ehrshot_pretraining_val_sample_info_path: str = field(
-        default="/data/EHR_data_public/EHRSHOT/pretraining_index/sample_info_val.csv"
+        default="/data/zikun_workspace/input/tables/ehrshot/pretraining_index/sample_info_val.csv"
     )
     include_pretraining_context: bool = field(default=True)
-    tte_index_dir: str = field(default="/data/zikun_workspace/tte_task_index")
+    tte_index_dir: str = field(default="/data/zikun_workspace/input/tasks/time_to_event")
     phenotype_spec_path: str = field(
         default="/data/zikun_workspace/.cache/phenotype_metric_learning/"
         "phenotype_query_specs.json"
@@ -216,7 +216,7 @@ def build_task_dataset(args: CacheBuildArguments, split: str):
 
 
 def tte_index_paths(args: CacheBuildArguments, dataset_name: str, split: str):
-    pattern = os.path.join(args.tte_index_dir, dataset_name, split, "*.csv")
+    pattern = os.path.join(args.tte_index_dir, dataset_name, "indices", split, "*.csv")
     return sorted(path for path in glob(pattern) if os.path.getsize(path) > 0)
 
 

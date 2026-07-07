@@ -2,16 +2,16 @@
 Generate pre-computed text embeddings for unique table texts in MIMIC-IV.
 
 Usage:
-    python preprocess/mimic_iv/8_generate_text_embeddings.py --stage harvest
-    python preprocess/mimic_iv/8_generate_text_embeddings.py --stage harvest \
-        --sample-csv /data/zikun_workspace/mimic-iv-3.1_tabular/task_index/train/*.csv \
-                     /data/zikun_workspace/mimic-iv-3.1_tabular/task_index/val/*.csv \
-                     /data/zikun_workspace/mimic-iv-3.1_tabular/task_index/test/*.csv
-    torchrun --nproc_per_node=8 preprocess/mimic_iv/8_generate_text_embeddings.py --stage encode \
+    python preprocess/mimic_iv/6_generate_text_embeddings.py --stage harvest
+    python preprocess/mimic_iv/6_generate_text_embeddings.py --stage harvest \
+        --sample-csv /data/zikun_workspace/input/tasks/classification/mimic_iv/index/train/*.csv \
+                     /data/zikun_workspace/input/tasks/classification/mimic_iv/index/val/*.csv \
+                     /data/zikun_workspace/input/tasks/classification/mimic_iv/index/test/*.csv
+    torchrun --nproc_per_node=8 preprocess/mimic_iv/6_generate_text_embeddings.py --stage encode \
         --model-path /data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT
-    torchrun --nproc_per_node=8 preprocess/mimic_iv/8_generate_text_embeddings.py --stage encode \
+    torchrun --nproc_per_node=8 preprocess/mimic_iv/6_generate_text_embeddings.py --stage encode \
         --model-path /data/zikun_workspace/checkpoints/pretraining/knowledge_encode/epoch_100.pt
-    torchrun --nproc_per_node=8 preprocess/mimic_iv/8_generate_text_embeddings.py --stage encode \
+    torchrun --nproc_per_node=8 preprocess/mimic_iv/6_generate_text_embeddings.py --stage encode \
         --model-path /data/zikun_workspace/checkpoints/knowledge_encoder/clinicalBERT_after_stage2/epoch_5.pt
 """
 import argparse
@@ -372,7 +372,7 @@ def parse_args():
         "--sample-csv",
         type=str,
         nargs="+",
-        default=["/data/zikun_workspace/mimic-iv-3.1_tabular/task_index/all/contrastive_learning.csv"],
+        default=["/data/zikun_workspace/input/tasks/classification/mimic_iv/index/all/contrastive_learning.csv"],
         help="Sample info CSV(s) to harvest table texts from. Comma-separated values are also accepted.",
     )
     parser.add_argument(

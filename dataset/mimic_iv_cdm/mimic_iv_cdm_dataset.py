@@ -25,11 +25,13 @@ class MIMICIVCDM(Dataset):
         shuffle=True,
         task_name=None,
         max_samples=None,
+        index_dir=None,
     ):
         super().__init__()
         random.seed(42)
 
         self.root_dir = root_dir
+        self.index_dir = index_dir or os.path.join(self.root_dir, "index")
         self.split = split
         self.lazy_mode = lazy_mode
         self.task_schema = get_task_info()
@@ -72,7 +74,7 @@ class MIMICIVCDM(Dataset):
                 self.raw_data[category] = pickle.load(f)
 
     def _load_index(self):
-        index_path = os.path.join(self.root_dir, "index", f"mimiciv_cdm_{self.split}.csv")
+        index_path = os.path.join(self.index_dir, f"mimiciv_cdm_{self.split}.csv")
         self.list_data = pd.read_csv(index_path).to_dict(orient="records")
 
     def _balance_samples(self, all_samples, max_samples):
@@ -200,6 +202,8 @@ class MIMICIVCDM(Dataset):
             return category
 
         icd_desc_list = index_item['icd']
+        if isinstance(icd_desc_list, str):
+            icd_desc_list = [item for item in icd_desc_list.split(";") if item]
         
         labels = []
         for desc in icd_desc_list:

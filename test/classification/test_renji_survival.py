@@ -44,7 +44,7 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_dir: str = field(default="/data/EHR_data_public/Renji")
+    data_dir: str = field(default="/data/zikun_workspace/input/tables/renji/raw")
     embedding_cache: str = field(
         default="/data/zikun_workspace/.cache/embeddings/renji/text_embeddings_stage2.pt"
     )
@@ -56,7 +56,7 @@ class DataArguments:
     split: str = field(default="test")
     seed: int = field(default=42)
     survival_task: str = field(default="tacrolimus_abnormal")
-    death_tte_index_dir: Optional[str] = field(default=None)
+    tte_index_dir: Optional[str] = field(default=None)
     patient_subset_path: Optional[str] = field(
         default="data/patients.json"
     )
@@ -94,8 +94,10 @@ def build_survival_dataset(dataset_cls, data_args, split):
         "shuffle": False,
         "patient_subset_path": data_args.patient_subset_path,
     }
+    if dataset_cls is RenjiTacrolimusSurvivalDataset:
+        kwargs["tte_index_dir"] = data_args.tte_index_dir
     if dataset_cls is RenjiDeathSurvivalDataset:
-        kwargs["death_tte_index_dir"] = data_args.death_tte_index_dir
+        kwargs["tte_index_dir"] = data_args.tte_index_dir
     return dataset_cls(**kwargs)
 
 

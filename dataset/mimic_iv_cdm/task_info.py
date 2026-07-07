@@ -17,6 +17,12 @@ TASK_INFO = {
             "appendicitis, cholecystitis, diverticulitis, pancreatitis. "
             "Answer with exactly one candidate."
         ),
+        "candidate_prompts": {
+            "appendicitis": "The patient's main diagnosis is appendicitis.",
+            "cholecystitis": "The patient's main diagnosis is cholecystitis.",
+            "diverticulitis": "The patient's main diagnosis is diverticulitis.",
+            "pancreatitis": "The patient's main diagnosis is pancreatitis.",
+        },
     },
 
     "MIMIC-IV-CDM ICD Code Diagnoses": {

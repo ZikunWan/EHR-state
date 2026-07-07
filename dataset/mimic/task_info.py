@@ -239,6 +239,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will be hospitalized after the emergency room visit.",
+        "candidate_prompts": {
+            "no": "The patient will not be hospitalized after the emergency room visit.",
+            "yes": "The patient will be hospitalized after the emergency room visit.",
+        },
     },
 
     "ED_Inpatient_Mortality": {
@@ -248,6 +252,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will die during hospitalization.",
+        "candidate_prompts": {
+            "no": "The patient will not die during hospitalization.",
+            "yes": "The patient will die during hospitalization.",
+        },
     },
 
     "ED_ICU_Tranfer_12hour": {
@@ -257,6 +265,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will be transferred to the ICU within 12 hours after the emergency room.",
+        "candidate_prompts": {
+            "no": "The patient will not be transferred to the ICU within 12 hours after the emergency room visit.",
+            "yes": "The patient will be transferred to the ICU within 12 hours after the emergency room visit.",
+        },
     },
 
     "ED_Reattendance_3day": {
@@ -266,6 +278,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will return to the emergency department within 72 hours after the emergency visit.",
+        "candidate_prompts": {
+            "no": "The patient will not return to the emergency department within 72 hours after the emergency visit.",
+            "yes": "The patient will return to the emergency department within 72 hours after the emergency visit.",
+        },
     },
 
     "ED_Critical_Outcomes": {
@@ -275,6 +291,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will die during hospitalization or will be transferred to the ICU within 12 hours after the emergency room.",
+        "candidate_prompts": {
+            "no": "The patient will not die during hospitalization and will not be transferred to the ICU within 12 hours after the emergency room visit.",
+            "yes": "The patient will die during hospitalization or be transferred to the ICU within 12 hours after the emergency room visit.",
+        },
     },
 
     "Readmission_30day": {
@@ -284,6 +304,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will be readmitted to the hospital within 30 days",
+        "candidate_prompts": {
+            "no": "The patient will not be readmitted to the hospital within 30 days.",
+            "yes": "The patient will be readmitted to the hospital within 30 days.",
+        },
     },
 
     "Readmission_60day": {
@@ -293,6 +317,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will be readmitted to the hospital within 60 days",
+        "candidate_prompts": {
+            "no": "The patient will not be readmitted to the hospital within 60 days.",
+            "yes": "The patient will be readmitted to the hospital within 60 days.",
+        },
     },
 
     "Inpatient_Mortality": {
@@ -302,6 +330,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will die during hospitalization.",
+        "candidate_prompts": {
+            "no": "The patient will not die during hospitalization.",
+            "yes": "The patient will die during hospitalization.",
+        },
     },
 
     "LengthOfStay_3day": {
@@ -311,6 +343,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient's hospital stay will exceed 3 days.",
+        "candidate_prompts": {
+            "no": "The patient's hospital stay will not exceed 3 days.",
+            "yes": "The patient's hospital stay will exceed 3 days.",
+        },
     },
 
     "LengthOfStay_7day": {
@@ -320,6 +356,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient's hospital stay will exceed 7 days",
+        "candidate_prompts": {
+            "no": "The patient's hospital stay will not exceed 7 days.",
+            "yes": "The patient's hospital stay will exceed 7 days.",
+        },
     },
 
     "ICU_Mortality_1day": {
@@ -329,6 +369,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will die within 1 day.",
+        "candidate_prompts": {
+            "no": "The patient will not die within 1 day.",
+            "yes": "The patient will die within 1 day.",
+        },
     },
 
     "ICU_Mortality_2day": {
@@ -338,6 +382,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will die within 2 day.",
+        "candidate_prompts": {
+            "no": "The patient will not die within 2 days.",
+            "yes": "The patient will die within 2 days.",
+        },
     },
 
     "ICU_Mortality_3day": {
@@ -347,6 +395,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will die within 3 day.",
+        "candidate_prompts": {
+            "no": "The patient will not die within 3 days.",
+            "yes": "The patient will die within 3 days.",
+        },
     },
 
     "ICU_Mortality_7day": {
@@ -356,6 +408,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will die within 7 day.",
+        "candidate_prompts": {
+            "no": "The patient will not die within 7 days.",
+            "yes": "The patient will die within 7 days.",
+        },
     },
 
     "ICU_Mortality_14day": {
@@ -365,6 +421,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will die within 14 day.",
+        "candidate_prompts": {
+            "no": "The patient will not die within 14 days.",
+            "yes": "The patient will die within 14 days.",
+        },
     },
 
     "ICU_Stay_7day": {
@@ -374,6 +434,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will stay in the ICU for more than 7 days.",
+        "candidate_prompts": {
+            "no": "The patient will not stay in the ICU for more than 7 days.",
+            "yes": "The patient will stay in the ICU for more than 7 days.",
+        },
     },
 
     "ICU_Stay_14day": {
@@ -383,6 +447,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will stay in the ICU for more than 14 days.",
+        "candidate_prompts": {
+            "no": "The patient will not stay in the ICU for more than 14 days.",
+            "yes": "The patient will stay in the ICU for more than 14 days.",
+        },
     },
 
     "ICU_Readmission": {
@@ -392,6 +460,10 @@ TASK_INFO = {
         "bid_event": [],
         "task_type": "binary_classification",
         "instruction": "Given the sequence of events that have occurred in a hospital, please predict whether the patient will be admitted to the ICU again during this hospitalization",
+        "candidate_prompts": {
+            "no": "The patient will not be admitted to the ICU again during this hospitalization.",
+            "yes": "The patient will be admitted to the ICU again during this hospitalization.",
+        },
     },
 
     "Time_to_Inpatient_Mortality_after_ED": {

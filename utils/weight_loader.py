@@ -57,7 +57,11 @@ def load_encoder_and_query_head_weights(
             remapped[key] = value
         elif key.startswith("task_query_head."):
             remapped["query_head." + key.removeprefix("task_query_head.")] = value
+        elif key.startswith("task_classifier."):
+            remapped["classifier." + key.removeprefix("task_classifier.")] = value
         elif key.startswith("query_head."):
+            remapped[key] = value
+        elif key.startswith("classifier."):
             remapped[key] = value
 
     model.load_state_dict(remapped, strict=False)

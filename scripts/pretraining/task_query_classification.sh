@@ -5,17 +5,17 @@ deepspeed --num_gpus=8 ./pretraining/task_query_classification.py \
     --deepspeed "./ds_config_zero2.json" \
     --dataset mimic_iv eicu ehrshot \
     --root_dir "/data/zikun_workspace/mimic-iv-3.1_tabular" \
-    --train_sample_info_path "/data/zikun_workspace/mimic-iv-3.1_tabular/task_index/train" \
-    --val_sample_info_path "/data/zikun_workspace/mimic-iv-3.1_tabular/task_index/val" \
+    --train_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/index/train" \
+    --val_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/index/val" \
     --table_text_embedding "/data/zikun_workspace/.cache/embeddings/mimic_iv/text_embeddings_stage2.pt" \
     --eicu_root_dir "/data/zikun_workspace/eicu-crd" \
     --eicu_processed_dir "/data/zikun_workspace/eicu-crd/processed" \
     --eicu_train_sample_info_path "/data/zikun_workspace/eicu-crd/processed/sample_info_train.json" \
     --eicu_val_sample_info_path "/data/zikun_workspace/eicu-crd/processed/sample_info_val.json" \
     --eicu_table_text_embedding "/data/zikun_workspace/.cache/embeddings/eicu/text_embeddings_stage2.pt" \
-    --ehrshot_root_dir "/data/EHR_data_public/EHRSHOT" \
-    --ehrshot_train_sample_info_path "/data/EHR_data_public/EHRSHOT/index/ehrshot_train.csv" \
-    --ehrshot_val_sample_info_path "/data/EHR_data_public/EHRSHOT/index/ehrshot_val.csv" \
+    --ehrshot_root_dir "/data/zikun_workspace/input/tables/ehrshot" \
+    --ehrshot_train_sample_info_path "/data/zikun_workspace/input/tasks/classification/ehrshot/indices/ehrshot_train.csv" \
+    --ehrshot_val_sample_info_path "/data/zikun_workspace/input/tasks/classification/ehrshot/indices/ehrshot_val.csv" \
     --ehrshot_table_text_embedding "/data/zikun_workspace/.cache/embeddings/ehrshot/text_embeddings_stage2.pt" \
     --query_embedding_cache "/data/zikun_workspace/.cache/embeddings/task_query_classification/task_query_llm_embeddings.pt" \
     --max_table_len 16384 \
@@ -35,7 +35,7 @@ deepspeed --num_gpus=8 ./pretraining/task_query_classification.py \
     --eval_steps 500 \
     --early_stopping_patience 10 \
     --wandb_project "Task_Query_Classification" \
-    --run_name "task_query_classification" \
+    --run_name "task_query_encoder_classifier" \
     --pretrained_path "/data/zikun_workspace/checkpoints/pretraining/next_token_prediction" \
     --output_dir "/data/zikun_workspace/checkpoints/pretraining/task_query_classification" \
     --max_train_samples 320000

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -14,13 +16,59 @@ from models.query_attention import QueryCrossAttentionHead
 
 
 @dataclass
-class CandidateDecoderOutput(ModelOutput):
+class QueryClassifierOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
-    scores: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
+    query_states: Optional[torch.Tensor] = None
 
 
-class TaskQueryCandidateDecoderModel(PreTrainedModel):
+class QueryClassificationHead(nn.Module):
+    def __init__(self, query_dim: int, hidden_dim: Optional[int] = None):
+        super().__init__()
+        hidden_dim = int(hidden_dim or query_dim)
+        self.net = nn.Sequential(
+            nn.LayerNorm(query_dim),
+            nn.Linear(query_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, query_states: torch.Tensor) -> torch.Tensor:
+        logits = self.net(query_states).squeeze(-1)
+        return logits
+
+
+def query_classification_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    query_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    labels = labels.to(logits.device)
+    if query_mask is not None:
+        logits = logits.masked_fill(
+            query_mask.to(logits.device) <= 0,
+            torch.finfo(logits.dtype).min,
+        )
+
+    if labels.shape == logits.shape:
+        valid_mask = labels != -100
+        if valid_mask.any():
+            return F.binary_cross_entropy_with_logits(
+                logits.float()[valid_mask],
+                labels.float()[valid_mask],
+            )
+        return logits.sum() * 0.0
+
+    if logits.dim() == 1 or (logits.dim() == 2 and logits.size(-1) == 1):
+        return F.binary_cross_entropy_with_logits(
+            logits.reshape(-1).float(),
+            labels.reshape(-1).float(),
+        )
+
+    return F.cross_entropy(logits.float(), labels.long())
+
+
+class EncoderClassifierModel(PreTrainedModel):
     config_class = LongTableEncoder1DConfig
     base_model_prefix = "encoder"
 
@@ -35,9 +83,7 @@ class TaskQueryCandidateDecoderModel(PreTrainedModel):
         self.adapter = QFormerAdapter(config)
         self.text_embedding = nn.Embedding.from_pretrained(embedding_matrix, freeze=True)
         self.query_head = QueryCrossAttentionHead(config, query_dim=query_dim)
-        self.answer_projection = nn.Linear(query_dim, query_dim)
-        self.candidate_projection = nn.Linear(query_dim, query_dim)
-        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+        self.classifier = QueryClassificationHead(query_dim=query_dim)
         self.post_init()
 
     def _init_weights(self, module):
@@ -60,14 +106,13 @@ class TaskQueryCandidateDecoderModel(PreTrainedModel):
         numeric_values: torch.Tensor,
         numeric_mask: torch.Tensor,
         query_embeds: torch.Tensor,
-        candidate_embeds: torch.Tensor,
-        candidate_mask: Optional[torch.Tensor] = None,
+        query_mask: Optional[torch.Tensor] = None,
         seq_mask: Optional[torch.Tensor] = None,
         type_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> CandidateDecoderOutput:
-        query_state = self.extract_features(
+    ) -> QueryClassifierOutput:
+        query_states = self.extract_features(
             item_ids=item_ids,
             unit_ids=unit_ids,
             value_text_ids=value_text_ids,
@@ -78,28 +123,13 @@ class TaskQueryCandidateDecoderModel(PreTrainedModel):
             seq_mask=seq_mask,
             type_ids=type_ids,
         )
-        answer_state = F.normalize(self.answer_projection(query_state), dim=-1)
-        candidate_state = F.normalize(self.candidate_projection(candidate_embeds.to(query_state.dtype)), dim=-1)
-        if answer_state.dim() == 2:
-            scores = torch.einsum("bd,bkd->bk", answer_state, candidate_state)
-        else:
-            scores = torch.einsum("bqd,bqkd->bqk", answer_state, candidate_state)
-        scores = scores * self.logit_scale.exp().clamp(max=100.0)
-        if candidate_mask is not None:
-            scores = scores.masked_fill(candidate_mask <= 0, torch.finfo(scores.dtype).min)
+        logits = self.classifier(query_states)
 
         loss = None
         if labels is not None:
-            if scores.dim() == 2:
-                loss = F.cross_entropy(scores.float(), labels.long())
-            else:
-                valid_mask = labels != -100
-                if valid_mask.any():
-                    loss = F.cross_entropy(scores.float()[valid_mask], labels.long()[valid_mask])
-                else:
-                    loss = scores.sum() * 0.0
+            loss = query_classification_loss(logits, labels, query_mask=query_mask)
 
-        return CandidateDecoderOutput(loss=loss, scores=scores, logits=scores)
+        return QueryClassifierOutput(loss=loss, logits=logits, query_states=query_states)
 
     def extract_features(
         self,
@@ -113,14 +143,10 @@ class TaskQueryCandidateDecoderModel(PreTrainedModel):
         seq_mask: Optional[torch.Tensor] = None,
         type_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        item_emb = self.text_embedding(item_ids)
-        unit_emb = self.text_embedding(unit_ids)
-        value_emb = self.text_embedding(value_text_ids)
-
         hidden_states, hidden_mask = self.encoder(
-            item_emb=item_emb,
-            unit_emb=unit_emb,
-            value_emb=value_emb,
+            item_emb=self.text_embedding(item_ids),
+            unit_emb=self.text_embedding(unit_ids),
+            value_emb=self.text_embedding(value_text_ids),
             times=times,
             numeric_values=numeric_values,
             numeric_mask=numeric_mask,
@@ -130,3 +156,11 @@ class TaskQueryCandidateDecoderModel(PreTrainedModel):
         )
         hidden_states = self.adapter(hidden_states, hidden_mask)
         return self.query_head(query_embeds, hidden_states, None)
+
+
+__all__ = [
+    "EncoderClassifierModel",
+    "QueryClassificationHead",
+    "QueryClassifierOutput",
+    "query_classification_loss",
+]

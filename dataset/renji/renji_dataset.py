@@ -1213,7 +1213,6 @@ STAGE_SPECS = (
     {"stage_id": 2, "start_day": 181.0, "end_day": 366.0, "num_bins": 185},
 )
 MAX_SURVIVAL_BINS = 185
-EVENT_LABEL_COLUMN = "他克莫司浓度_label"
 DEATH_SURVIVAL_HORIZON_DAYS = 1825
 DEATH_STAGE_SPECS = (
     {
@@ -1283,30 +1282,6 @@ def build_piecewise_survival_target(
     return bin_exposure, event_bins, stage_mask
 
 
-def _parse_binary_label(value):
-    if pd.isna(value) or str(value).strip() == "":
-        return None
-    try:
-        return 1 if float(value) > 0 else 0
-    except (TypeError, ValueError):
-        return None
-
-
-def _parse_truthy(value):
-    if pd.isna(value):
-        return False
-    text = str(value).strip().lower()
-    return text in {"true", "1", "yes", "y", "死亡", "deceased", "dead"}
-
-
-def _days_between(start, end):
-    start = pd.to_datetime(start, errors="coerce")
-    end = pd.to_datetime(end, errors="coerce")
-    if pd.isna(start) or pd.isna(end):
-        return None
-    return max((end - start).total_seconds() / 86400.0, 0.0)
-
-
 class RenjiTacrolimusSurvivalDataset(RenjiDataset):
     """One time-to-event sample per patient and postoperative stage."""
 
@@ -1320,11 +1295,11 @@ class RenjiTacrolimusSurvivalDataset(RenjiDataset):
         max_samples=None,
         shuffle=False,
         patient_subset_path=None,
-        death_tte_index_dir=None,
+        tte_index_dir=None,
     ):
         self.patient_subset_path = patient_subset_path
         self.patient_subset = load_patient_subset(patient_subset_path)
-        self.death_tte_index_dir = death_tte_index_dir
+        self.tte_index_dir = tte_index_dir
         self.root_dir = root_dir
         self.split = split
         self.max_samples = max_samples
@@ -1338,115 +1313,80 @@ class RenjiTacrolimusSurvivalDataset(RenjiDataset):
         self.measurement_cache_dir = os.path.join(self.root_dir, "cache", "measurement_table")
         self._init_configs()
         self._load_auxiliary_data()
-
-        split_table = pd.read_csv(
-            os.path.join(self.root_dir, "all_samples.csv"),
-            encoding="utf-8-sig",
-        )
-        split_files = split_table.loc[
-            split_table["split"] == split,
-            "file_name",
-        ].drop_duplicates()
-        self.filenames = split_files.astype(str).tolist()
         self._valid_followup_cache = {}
         self.samples = self._build_index()
 
-    def _read_raw_followup(self, fname):
-        path = os.path.join(
-            self.followup_dir,
-            fname if fname.endswith(".csv") else f"{fname}.csv",
-        )
-        df = pd.read_csv(path, encoding="utf-8-sig")
-        if "术后天数" not in df.columns:
-            return pd.DataFrame()
-        df["术后天数"] = pd.to_numeric(df["术后天数"], errors="coerce")
-        if "报告日期" in df.columns:
-            df["报告日期"] = pd.to_datetime(df["报告日期"], errors="coerce")
-            df = df.sort_values(["术后天数", "报告日期"], na_position="last")
-        else:
-            df = df.sort_values("术后天数", na_position="last")
-        return df.dropna(subset=["术后天数"]).reset_index(drop=True)
+    def _index_path(self):
+        index_dir = self.tte_index_dir or self.index_dir
+        return os.path.join(index_dir, f"tacrolimus_tte_{self.split}.csv")
 
-    def _build_index(self):
-        _rank0_print(f"[{self.split}] Building tacrolimus survival sample index...")
-        samples = []
-        split_filenames = self.filenames
+    def _load_index_rows(self):
+        index_path = self._index_path()
+        if not os.path.exists(index_path):
+            raise FileNotFoundError(
+                f"Tacrolimus TTE index not found: {index_path}. "
+                "Run preprocess/Renji/generate_tte_task_index.py first."
+            )
+        _rank0_print(f"[{self.split}] Loading tacrolimus survival index: {index_path}")
+        index_df = pd.read_csv(index_path)
+        rows = index_df.to_dict(orient="records")
         if self.patient_subset is not None:
-            split_filenames = [
-                fname
-                for fname in self.filenames
-                if os.path.splitext(os.path.basename(str(fname)))[0]
+            rows = [
+                row
+                for row in rows
+                if str(row.get("fname_key") or os.path.splitext(str(row.get("file_name")))[0])
                 in self.patient_subset
             ]
             _rank0_print(
                 f"[{self.split}] Patient subset filter: "
-                f"{len(split_filenames)}/{len(self.filenames)} split patients retained "
+                f"{len(rows)}/{len(index_df)} index rows retained "
                 f"from {self.patient_subset_path}"
             )
-            if not split_filenames:
+            if not rows:
                 raise ValueError(
                     f"No {self.split} patients matched {self.patient_subset_path}"
                 )
+        return rows
 
-        for fname in tqdm(
-            split_filenames,
-            desc=f"[{self.split}] Survival indexing",
-            disable=not _is_main_process(),
-        ):
-            fname_key = os.path.splitext(fname)[0]
+    def _build_index_from_rows(self, rows):
+        samples = []
+        for row in rows:
+            fname = str(row["file_name"])
+            fname_key = str(row.get("fname_key") or os.path.splitext(fname)[0])
             if fname_key not in self.patient_info_map:
                 continue
-            raw_followup = self._read_raw_followup(fname)
+            time_to_event = float(row["time_to_event"])
+            event_observed = bool(int(row["event_observed"]))
+            num_bins = int(row["num_bins"])
+            exposure, event_bins, stage_mask = build_piecewise_survival_target(
+                time_to_event=time_to_event,
+                event_observed=event_observed,
+                num_bins=num_bins,
+            )
+            samples.append(
+                {
+                    "fname": fname,
+                    "fname_key": fname_key,
+                    "stage_id": int(row["stage_id"]),
+                    "stage_start_day": float(row["stage_start_day"]),
+                    "stage_end_day": float(row["stage_end_day"]),
+                    "num_bins": num_bins,
+                    "prediction_day": float(row["prediction_day"]),
+                    "cutoff_day": float(row["cutoff_day"]),
+                    "observed_day": float(row["observed_day"]),
+                    "time_to_event": time_to_event,
+                    "event_observed": event_observed,
+                    "stage_end_horizon": float(row["stage_end_horizon"]),
+                    "bin_exposure": exposure,
+                    "event_bins": event_bins,
+                    "stage_mask": stage_mask,
+                }
+            )
+        return samples
 
-            for spec in self.STAGE_SPECS:
-                stage_rows = raw_followup[
-                    (raw_followup["术后天数"] >= spec["start_day"])
-                    & (raw_followup["术后天数"] < spec["end_day"])
-                ]
-                if stage_rows.empty:
-                    continue
-
-                prediction_day = float(stage_rows["术后天数"].iloc[0])
-                future_rows = stage_rows[stage_rows["术后天数"] > prediction_day]
-                event_day = None
-                if EVENT_LABEL_COLUMN in future_rows.columns:
-                    for _, row in future_rows.iterrows():
-                        if _parse_binary_label(row[EVENT_LABEL_COLUMN]) == 1:
-                            event_day = float(row["术后天数"])
-                            break
-
-                event_observed = event_day is not None
-                observed_day = (
-                    event_day
-                    if event_observed
-                    else float(stage_rows["术后天数"].iloc[-1])
-                )
-                time_to_event = max(0.0, observed_day - prediction_day)
-                exposure, event_bins, stage_mask = build_piecewise_survival_target(
-                    time_to_event=time_to_event,
-                    event_observed=event_observed,
-                    num_bins=spec["num_bins"],
-                )
-                samples.append(
-                    {
-                        "fname": fname,
-                        "fname_key": fname_key,
-                        "stage_id": spec["stage_id"],
-                        "stage_start_day": spec["start_day"],
-                        "stage_end_day": spec["end_day"],
-                        "num_bins": spec["num_bins"],
-                        "prediction_day": prediction_day,
-                        "cutoff_day": prediction_day,
-                        "observed_day": observed_day,
-                        "time_to_event": time_to_event,
-                        "event_observed": event_observed,
-                        "stage_end_horizon": spec["end_day"] - prediction_day,
-                        "bin_exposure": exposure,
-                        "event_bins": event_bins,
-                        "stage_mask": stage_mask,
-                    }
-                )
-
+    def _build_index(self):
+        index_rows = self._load_index_rows()
+        samples = self._build_index_from_rows(index_rows)
         if self.max_samples and len(samples) > self.max_samples:
             indices = np.random.choice(len(samples), self.max_samples, replace=False)
             samples = [samples[index] for index in indices]
@@ -1455,8 +1395,8 @@ class RenjiTacrolimusSurvivalDataset(RenjiDataset):
 
         events = sum(sample["event_observed"] for sample in samples)
         _rank0_print(
-            f"[{self.split}] Survival samples={len(samples)}, events={events}, "
-            f"censored={len(samples) - events}"
+            f"[{self.split}] Tacrolimus survival samples={len(samples)}, "
+            f"events={events}, censored={len(samples) - events}"
         )
         return samples
 
@@ -1550,9 +1490,11 @@ class RenjiDeathSurvivalDataset(RenjiDataset):
         max_samples=None,
         shuffle=False,
         patient_subset_path=None,
+        tte_index_dir=None,
     ):
         self.patient_subset_path = patient_subset_path
         self.patient_subset = load_patient_subset(patient_subset_path)
+        self.tte_index_dir = tte_index_dir
         self.root_dir = root_dir
         self.split = split
         self.max_samples = max_samples
@@ -1582,7 +1524,7 @@ class RenjiDeathSurvivalDataset(RenjiDataset):
         _rank0_print(f"Loaded patient info: {len(self.patient_info_map)} patients")
 
     def _index_path(self):
-        index_dir = self.death_tte_index_dir or self.index_dir
+        index_dir = self.tte_index_dir or self.index_dir
         return os.path.join(index_dir, f"death_tte_{self.split}.csv")
 
     def _build_index(self):
@@ -1590,7 +1532,7 @@ class RenjiDeathSurvivalDataset(RenjiDataset):
         if not os.path.exists(index_path):
             raise FileNotFoundError(
                 f"Death TTE index not found: {index_path}. "
-                "Run preprocess/Renji/4_generate_death_tte_index.py first."
+                "Run preprocess/Renji/generate_tte_task_index.py first."
             )
         _rank0_print(f"[{self.split}] Loading death survival index: {index_path}")
         index_df = pd.read_csv(index_path)

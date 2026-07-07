@@ -10,11 +10,19 @@ TASK_INFO = {
         "metric": "auroc",
         "task_type": "binary_classification",
         "instruction_template": "Based on the patient's clinical history up to {prediction_point}, predict whether {metric} will be abnormal in the next label window ({label_window}).",
+        "candidate_prompts": {
+            "no": "The future metric will not be abnormal in the label window.",
+            "yes": "The future metric will be abnormal in the label window.",
+        },
     },
     "candidate_metric_prediction": {
         "metric": "auroc",
         "task_type": "candidate_classification",
         "instruction_template": "Based on the patient's clinical history up to {prediction_point}, predict each future metric abnormality as an independent no/yes candidate task.",
+        "candidate_prompts": {
+            "no": "The future metric will not be abnormal in the label window.",
+            "yes": "The future metric will be abnormal in the label window.",
+        },
     },
     "tacrolimus_abnormal_survival": {
         "metric": "survival",

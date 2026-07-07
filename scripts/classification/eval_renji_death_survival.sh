@@ -3,11 +3,11 @@ set -e
 
 CUDA_VISIBLE_DEVICES=0 python test/classification/test_renji_survival.py \
     --survival_task death \
-    --data_dir "/data/EHR_data_public/Renji" \
+    --data_dir "/data/zikun_workspace/input/tables/renji/raw" \
     --embedding_cache "/data/zikun_workspace/.cache/embeddings/renji/text_embeddings_stage2.pt" \
     --checkpoint_dir "/data/zikun_workspace/checkpoints/renji/death_survival" \
     --patient_subset_path "data/patients.json" \
-    --death_tte_index_dir "data/renji_tte_index" \
+    --tte_index_dir "/data/zikun_workspace/input/tasks/time_to_event/renji/indices" \
     --split test \
     --type_vocab_file "data/type_vocab.json" \
     --query_embedding_cache "/data/zikun_workspace/.cache/embeddings/query_candidate/renji_death_survival_task_query_knowledge_embeddings.pt" \

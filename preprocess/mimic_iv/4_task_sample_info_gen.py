@@ -24,7 +24,6 @@ import argparse
 # Runtime context initialized lazily so this script does not depend on sample_info CSV at import time.
 DATASET = None
 ICD_TO_CCS_MAPPING = {}
-INCLUDE_FIRST_ADMISSION_PRETRAINING = False
 
 
 def normalize_binary_target(target):
@@ -44,13 +43,9 @@ def _infer_root_dir(args):
 
 
 def ensure_runtime_context(args):
-    global DATASET, ICD_TO_CCS_MAPPING, INCLUDE_FIRST_ADMISSION_PRETRAINING
+    global DATASET, ICD_TO_CCS_MAPPING
     if DATASET is not None:
         return
-
-    INCLUDE_FIRST_ADMISSION_PRETRAINING = bool(
-        getattr(args, "include_first_admission_pretraining", False)
-    )
 
     root_dir = _infer_root_dir(args)
     origin_data_dir = os.path.join(root_dir, "index_mapping")
@@ -559,12 +554,7 @@ def pretraining_task_extraction(task_list, trajectory_id, patient_trajectory_lis
         # pretraining_task_extraction.debug_counts['no_admission'] += 1
         return []
 
-    # Default behavior: require a previous discharge.
-    # Optional behavior: include first admission samples by using
-    # [admissions, current discharge) as context window.
     if last_discharge_id is None:
-        if not INCLUDE_FIRST_ADMISSION_PRETRAINING:
-            return []
         context_begin = admissions_id + 1
     else:
         context_begin = last_discharge_id + 1
@@ -706,21 +696,20 @@ def ehr_anslysis(args, subject_id):
 
 def obtain_patients_id(args):
     """
-    Load patient IDs from CSV file.
-    
-    Note: Trajectory length filtering has been removed as it requires event_static.parquet
-    which may not be available. Filtering by trajectory length will be done later in
-    data_index_gen.py using the traj_len_min and traj_len_max parameters.
+    Load patient IDs from CSV when provided; otherwise infer them from patients_ehr/*.parquet.
     """
-    patients_file = os.path.join(args.patient_ids_path)
-    df = pd.read_csv(patients_file)
-    patient_ids = df["subject_id"].tolist()
-    patient_ids = [str(id) for id in patient_ids]
-    
-    print(f"Get {len(patient_ids)} patients from {args.patient_ids_path}...")
-    
-    # Original trajectory length filtering code removed (required event_static.parquet)
-    # Filtering will be done in data_index_gen.py instead
+    if args.patient_ids_path:
+        df = pd.read_csv(args.patient_ids_path)
+        patient_ids = [str(id) for id in df["subject_id"].tolist()]
+        print(f"Get {len(patient_ids)} patients from {args.patient_ids_path}...")
+        return patient_ids
+
+    patient_ids = sorted(
+        os.path.splitext(filename)[0]
+        for filename in os.listdir(args.ehr_dir)
+        if filename.endswith(".parquet")
+    )
+    print(f"Get {len(patient_ids)} patients from {args.ehr_dir}...")
     
     return patient_ids
 
@@ -798,17 +787,11 @@ def parse_args():
     parser = argparse.ArgumentParser(prog="EHR Data Filter and Selection")
 
     # basic args
-    parser.add_argument("--patient_ids_path", type=str, required=True)
+    parser.add_argument("--patient_ids_path", type=str, default=None)
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--root_dir", type=str, default=None,
                         help="Dataset root containing index_mapping/, cache/, and patients_ehr/. "
                              "If omitted, inferred from --ehr_dir parent directory.")
-    parser.add_argument(
-        "--include_first_admission_pretraining",
-        action="store_true",
-        help="Include first-admission pretraining samples with no previous discharge by "
-             "using the admission->discharge window.",
-    )
     parser.add_argument("--ehr_dir", type=str, default="/data/zikun_workspace/mimic-iv-3.1_tabular/patients_ehr")
     parser.add_argument("--group", choices=["patient", "task"], default="task")
     parser.add_argument("--task", type=str_list, default=None)

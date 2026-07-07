@@ -345,13 +345,12 @@ def create_query_collate_fn(
     return collate_fn
 
 
-def create_candidate_collate_fn(
+def create_multi_query_classifier_collate_fn(
     type_vocab=None,
     max_table_len: Optional[int] = None,
     text_to_idx: Optional[Dict[str, int]] = None,
     pad_idx: int = 0,
     query_embeddings_by_text: Optional[Dict[str, torch.Tensor]] = None,
-    candidate_embeddings_by_text: Optional[Dict[str, torch.Tensor]] = None,
     include_metadata: bool = False,
 ):
     if type_vocab is None:
@@ -360,7 +359,6 @@ def create_candidate_collate_fn(
     def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         tables = []
         query_embed_rows = []
-        candidate_embed_rows = []
         label_rows = []
         metadata = []
 
@@ -376,18 +374,10 @@ def create_candidate_collate_fn(
 
             tables.append(table)
             sample_query_embeds = []
-            sample_candidate_embeds = []
             sample_labels = []
             sample_metadata = []
             for task in tasks:
-                candidates = [str(candidate) for candidate in task["candidates"]]
                 sample_query_embeds.append(query_embeddings_by_text[str(task["query"])].float())
-                sample_candidate_embeds.append(
-                    [
-                        candidate_embeddings_by_text[candidate].float()
-                        for candidate in candidates
-                    ]
-                )
                 sample_labels.append(int(task["label"]))
                 if include_metadata:
                     sample_metadata.append(
@@ -399,7 +389,6 @@ def create_candidate_collate_fn(
                         }
                     )
             query_embed_rows.append(sample_query_embeds)
-            candidate_embed_rows.append(sample_candidate_embeds)
             label_rows.append(sample_labels)
             if include_metadata:
                 metadata.append(sample_metadata)
@@ -415,24 +404,19 @@ def create_candidate_collate_fn(
         )
         batch_size = len(query_embed_rows)
         max_queries = max(len(row) for row in query_embed_rows)
-        max_candidates = max(len(candidates) for row in candidate_embed_rows for candidates in row)
         query_dim = int(query_embed_rows[0][0].numel())
 
         query_embeds = torch.zeros(batch_size, max_queries, query_dim)
-        candidate_embeds = torch.zeros(batch_size, max_queries, max_candidates, query_dim)
-        candidate_mask = torch.zeros(batch_size, max_queries, max_candidates)
-        labels = torch.full((batch_size, max_queries), -100, dtype=torch.long)
+        labels = torch.full((batch_size, max_queries), -100, dtype=torch.float)
+        query_mask = torch.zeros(batch_size, max_queries, dtype=torch.float)
         for batch_idx, task_queries in enumerate(query_embed_rows):
             for query_idx, query_embed in enumerate(task_queries):
                 query_embeds[batch_idx, query_idx] = query_embed
-                labels[batch_idx, query_idx] = label_rows[batch_idx][query_idx]
-                for candidate_idx, candidate_embed in enumerate(candidate_embed_rows[batch_idx][query_idx]):
-                    candidate_embeds[batch_idx, query_idx, candidate_idx] = candidate_embed
-                    candidate_mask[batch_idx, query_idx, candidate_idx] = 1.0
+                labels[batch_idx, query_idx] = float(label_rows[batch_idx][query_idx])
+                query_mask[batch_idx, query_idx] = 1.0
 
         tensors["query_embeds"] = query_embeds
-        tensors["candidate_embeds"] = candidate_embeds
-        tensors["candidate_mask"] = candidate_mask
+        tensors["query_mask"] = query_mask
         tensors["labels"] = labels
         if include_metadata:
             tensors["metadata"] = metadata
@@ -441,7 +425,7 @@ def create_candidate_collate_fn(
     return collate_fn
 
 
-def _parse_candidate_label(raw_label, label_map=None):
+def parse_classification_label(raw_label, label_map=None):
     if isinstance(raw_label, torch.Tensor):
         if raw_label.numel() == 1:
             return int(raw_label.item())
@@ -467,13 +451,12 @@ def _parse_candidate_label(raw_label, label_map=None):
     return int(raw_label)
 
 
-def create_single_query_candidate_collate_fn(
+def create_query_classifier_collate_fn(
     type_vocab=None,
     max_table_len: Optional[int] = None,
     text_to_idx: Optional[Dict[str, int]] = None,
     pad_idx: int = 0,
-    query_embed: Optional[torch.Tensor] = None,
-    candidate_embeds: Optional[torch.Tensor] = None,
+    query_embeds: Optional[torch.Tensor] = None,
     label_map: Optional[Dict[str, int]] = None,
 ):
     if type_vocab is None:
@@ -495,7 +478,7 @@ def create_single_query_candidate_collate_fn(
             if max_table_len is not None:
                 table = table.tail(max_table_len).reset_index(drop=True)
             tables.append(table)
-            labels.append(_parse_candidate_label(sample["output"], label_map=label_map))
+            labels.append(parse_classification_label(sample["output"], label_map=label_map))
 
         tensors = build_table_token_tensors(
             tables,
@@ -504,9 +487,12 @@ def create_single_query_candidate_collate_fn(
             type_vocab=type_vocab,
         )
         batch_size = len(tables)
-        tensors["query_embeds"] = query_embed.float().unsqueeze(0).expand(batch_size, -1).clone()
-        tensors["candidate_embeds"] = candidate_embeds.float().unsqueeze(0).expand(batch_size, -1, -1).clone()
-        tensors["candidate_mask"] = torch.ones(batch_size, candidate_embeds.size(0), dtype=torch.float32)
+        query_tensor = query_embeds.float()
+        if query_tensor.dim() == 1:
+            tensors["query_embeds"] = query_tensor.unsqueeze(0).expand(batch_size, -1).clone()
+        else:
+            tensors["query_embeds"] = query_tensor.unsqueeze(0).expand(batch_size, -1, -1).clone()
+            tensors["query_mask"] = torch.ones(batch_size, query_tensor.size(0), dtype=torch.float32)
         tensors["labels"] = torch.tensor(labels, dtype=torch.long)
         return tensors
 

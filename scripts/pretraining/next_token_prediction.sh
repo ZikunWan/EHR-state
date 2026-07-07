@@ -6,16 +6,16 @@ deepspeed --num_gpus=8 ./pretraining/next_token_prediction.py \
     --dataset mimic_iv eicu ehrshot \
     --root_dir "/data/zikun_workspace/mimic-iv-3.1_tabular" \
     --train_info_path \
-        "/data/zikun_workspace/mimic-iv-3.1_tabular/task_index/train/next_token_prediction.csv" \
+        "/data/zikun_workspace/input/tasks/classification/mimic_iv/index/train/next_token_prediction.csv" \
     --table_text_embedding "/data/zikun_workspace/.cache/embeddings/mimic_iv/text_embeddings_stage2.pt" \
     --eicu_root_dir "/data/zikun_workspace/eicu-crd" \
     --eicu_processed_dir "/data/zikun_workspace/eicu-crd/processed" \
     --eicu_train_info_path \
         "/data/zikun_workspace/eicu-crd/processed/pretraining_index/sample_info_train.json" \
     --eicu_table_text_embedding "/data/zikun_workspace/.cache/embeddings/eicu/text_embeddings_stage2.pt" \
-    --ehrshot_root_dir "/data/EHR_data_public/EHRSHOT" \
+    --ehrshot_root_dir "/data/zikun_workspace/input/tables/ehrshot" \
     --ehrshot_train_info_path \
-        "/data/EHR_data_public/EHRSHOT/pretraining_index/sample_info_train.csv" \
+        "/data/zikun_workspace/input/tables/ehrshot/pretraining_index/sample_info_train.csv" \
     --ehrshot_table_text_embedding "/data/zikun_workspace/.cache/embeddings/ehrshot/text_embeddings_stage2.pt" \
     --max_table_len 16384 \
     --per_device_train_batch_size 4 \

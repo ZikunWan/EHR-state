@@ -232,7 +232,7 @@ def _init_ehrshot_table_length_worker(root_dir):
     global _TABLE_LENGTH_WORKER_DATASET
     worker_dataset = EHRSHOTDataset.__new__(EHRSHOTDataset)
     worker_dataset.root_dir = root_dir
-    worker_dataset.ehr_dir = os.path.join(root_dir, "patient_ehr")
+    worker_dataset.ehr_dir = os.path.join(root_dir, "patients")
     code_2_description_path = os.path.join(root_dir, "utils/code_2_description.json")
     with open(code_2_description_path, 'r', encoding='utf-8') as f:
         worker_dataset.code_2_description = json.load(f)
@@ -262,7 +262,7 @@ class EHRSHOTDataset(Dataset):
         
         self.task_schema = get_task_info()
         self.root_dir = root_dir
-        self.ehr_dir = os.path.join(root_dir, "patient_ehr")
+        self.ehr_dir = os.path.join(root_dir, "patients")
         self.patient_cache_size = int(os.environ.get("EHRSHOT_PATIENT_CACHE_SIZE", "8"))
         self._patient_cache = OrderedDict()
         self.sample_info_path = sample_info_path

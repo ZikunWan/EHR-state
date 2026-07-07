@@ -11,7 +11,7 @@ from transformers import HfArgumentParser
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from pretraining.phenotype_metric_learning import (
+from outdated.phenotype_metric_learning import (
     DataArguments,
     build_split_records,
     discover_numeric_query_specs,

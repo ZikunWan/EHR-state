@@ -310,14 +310,14 @@ def parse_args():
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="/data/EHR_data_public/EHRSHOT",
+        default="/data/zikun_workspace/input/tables/ehrshot",
         help="EHRSHOT data root.",
     )
     parser.add_argument(
         "--index-file",
         type=str,
         default="",
-        help="Sample index CSV. Defaults to <data-dir>/index/ehrshot_all.csv.",
+        help="Sample index CSV.",
     )
     parser.add_argument(
         "--model-path",
@@ -358,7 +358,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    args.index_file = args.index_file or os.path.join(args.data_dir, "index", "ehrshot_all.csv")
+    args.index_file = args.index_file or "/data/zikun_workspace/input/tasks/classification/ehrshot/indices/ehrshot_all.csv"
     args.harvest_checkpoint = args.harvest_checkpoint or os.path.join(
         args.cache_dir, "unique_texts_harvested.pkl"
     )

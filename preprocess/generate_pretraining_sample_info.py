@@ -13,8 +13,9 @@ Examples:
 
     python preprocess/generate_pretraining_sample_info.py \
         --dataset ehrshot \
-        --root_dir /data/EHR_data_public/EHRSHOT \
-        --output_dir /data/EHR_data_public/EHRSHOT/pretraining_index
+        --root_dir /data/zikun_workspace/input/tables/ehrshot \
+        --ehrshot_index_dir /data/zikun_workspace/input/tasks/classification/ehrshot/indices \
+        --output_dir /data/zikun_workspace/input/tables/ehrshot/pretraining_index
 """
 
 import argparse
@@ -210,8 +211,8 @@ def generate_ehrshot_visits_for_patient(patient_path, split, args):
 
 
 def generate_ehrshot_samples(args):
-    split_map = load_ehrshot_split_map(os.path.join(args.root_dir, "index"))
-    patient_paths = sorted(glob.glob(os.path.join(args.root_dir, "patient_ehr", "*.csv")))
+    split_map = load_ehrshot_split_map(args.ehrshot_index_dir)
+    patient_paths = sorted(glob.glob(os.path.join(args.root_dir, "patients", "*.csv")))
     samples_by_split = {split: [] for split in args.splits}
     for patient_path in tqdm(patient_paths, desc="EHRSHOT patients"):
         patient_id = os.path.splitext(os.path.basename(patient_path))[0]
@@ -227,7 +228,12 @@ def generate_ehrshot_samples(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["eicu", "ehrshot"], required=True)
-    parser.add_argument("--root_dir", type=str, default="/data/EHR_data_public/EHRSHOT")
+    parser.add_argument("--root_dir", type=str, default="/data/zikun_workspace/input/tables/ehrshot")
+    parser.add_argument(
+        "--ehrshot_index_dir",
+        type=str,
+        default="/data/zikun_workspace/input/tasks/classification/ehrshot/indices",
+    )
     parser.add_argument("--processed_dir", type=str, default="/data/zikun_workspace/eicu-crd/processed")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--ehrshot_visit_code", type=str, default="Visit/IP")

@@ -12,8 +12,10 @@ import pandas as pd
 from tqdm import tqdm
 
 
-DEFAULT_LABELED_DIR = "/data/EHR_data_public/Renji/follow_ups"
-DEFAULT_OUTPUT_FILE = "/data/EHR_data_public/Renji/labels.csv"
+DEFAULT_DATA_DIR = "/data/zikun_workspace/input/tables/renji/raw"
+DEFAULT_LABELED_DIR = f"{DEFAULT_DATA_DIR}/follow_ups"
+DEFAULT_OUTPUT_FILE = f"{DEFAULT_DATA_DIR}/labels.csv"
+DEFAULT_PATIENT_INFO_FILE = f"{DEFAULT_DATA_DIR}/患儿基本信息总表251023_含免疫事件.csv"
 
 # Post-op day windows aligned with the updated Renji task definition.
 WINDOWS = {
@@ -28,32 +30,18 @@ WINDOWS = {
 TARGET_LABEL_COLUMNS = [
     "ALB_label",
     "ALP_label",
-    "ALT_label",
-    "AST_label",
-    "CMV-DNA_label",
     "CR_label",
-    "DB_label",
-    "EBV-DNA_label",
-    "HBV-DNA_label",
+    "血糖_label",
     "HB_label",
     "INR_label",
     "N(%)_label",
     "PLT_label",
     "PT_label",
-    "TB_label",
     "TP_label",
     "WBC_label",
-    "γ-GT_label",
-    "他克莫司浓度_label",
     "尿酸_label",
-    "总胆固醇_label",
-    "淋巴细胞绝对值_label",
-    "环孢素峰浓度_label",
-    "环孢素谷浓度_label",
-    "甘油三脂_label",
-    "胆汁酸_label",
-    "血糖_label",
 ]
+TACROLIMUS_LABEL_COLUMN = "他克莫司浓度_label"
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +55,11 @@ def parse_args() -> argparse.Namespace:
         "--output-file",
         default=DEFAULT_OUTPUT_FILE,
         help="Path to save the generated labels.csv.",
+    )
+    parser.add_argument(
+        "--patient-info-file",
+        default=DEFAULT_PATIENT_INFO_FILE,
+        help="Patient info CSV used to add death_survival labels.",
     )
     parser.add_argument(
         "--workers",
@@ -154,10 +147,14 @@ def process_patient(args_tuple):
             return ("no_postop_days", file_name, list(df.columns)[:10])
 
         available_label_cols = [col for col in label_cols if col in df.columns]
-        if not available_label_cols:
+        has_tacrolimus_label = TACROLIMUS_LABEL_COLUMN in df.columns
+        if not available_label_cols and not has_tacrolimus_label:
             return ("no_label_cols", file_name, list(df.columns)[:10])
 
-        patient_row = {"filename": filename}
+        patient_row = {
+            "filename": filename,
+            "tacrolimus_abnormal_survival": np.nan,
+        }
         for window_name in WINDOWS:
             for label_col in label_cols:
                 metric_name = label_col[: -len("_label")]
@@ -188,6 +185,23 @@ def process_patient(args_tuple):
                 else:
                     patient_row[target_col] = max(float(current_val), val_binary)
 
+            if has_tacrolimus_label:
+                val = row.get(TACROLIMUS_LABEL_COLUMN)
+                if pd.isna(val) or str(val).strip() == "":
+                    continue
+                try:
+                    val_binary = 1.0 if float(val) > 0 else 0.0
+                except Exception:
+                    continue
+                current_val = patient_row["tacrolimus_abnormal_survival"]
+                if pd.isna(current_val):
+                    patient_row["tacrolimus_abnormal_survival"] = val_binary
+                else:
+                    patient_row["tacrolimus_abnormal_survival"] = max(
+                        float(current_val),
+                        val_binary,
+                    )
+
         return patient_row
     except Exception as exc:
         return ("error", file_name, f"{type(exc).__name__}: {exc}")
@@ -197,6 +211,44 @@ def ensure_parent_dir(path: str):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+
+def is_truthy(value) -> bool:
+    return str(value).strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "y",
+        "死亡",
+        "deceased",
+        "dead",
+    }
+
+
+def add_death_survival_labels(labels_df: pd.DataFrame, patient_info_file: str) -> pd.DataFrame:
+    labels_df["death_survival"] = np.nan
+    if not os.path.exists(patient_info_file):
+        print(f"[WARNING] Patient info file not found: {patient_info_file}")
+        return labels_df
+
+    patient_info = read_csv_with_fallback(patient_info_file, "utf-8-sig")
+    if "file_name" not in patient_info.columns or "is_deceased" not in patient_info.columns:
+        print(
+            "[WARNING] Patient info file does not contain file_name/is_deceased; "
+            "death_survival will be NaN."
+        )
+        return labels_df
+
+    death_map = {}
+    for _, row in patient_info.iterrows():
+        fname_key = os.path.splitext(str(row["file_name"]))[0]
+        death_map[fname_key] = 1.0 if is_truthy(row.get("is_deceased")) else 0.0
+
+    labels_df["death_survival"] = labels_df["filename"].map(death_map)
+    missing = labels_df["death_survival"].isna().sum()
+    if missing:
+        print(f"[WARNING] Missing death_survival labels for {missing} patients.")
+    return labels_df
 
 
 def main():
@@ -267,8 +319,9 @@ def main():
         return
 
     labels_df = pd.DataFrame(data).sort_values("filename").reset_index(drop=True)
+    labels_df = add_death_survival_labels(labels_df, args.patient_info_file)
 
-    ordered_columns = ["filename"]
+    ordered_columns = ["filename", "death_survival", "tacrolimus_abnormal_survival"]
     metric_names = [col[: -len("_label")] for col in label_cols]
     for window_name in WINDOWS:
         for metric_name in metric_names:

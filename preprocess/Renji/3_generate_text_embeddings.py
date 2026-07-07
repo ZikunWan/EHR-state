@@ -317,13 +317,13 @@ def parse_args():
     parser.add_argument(
         "--root-dir",
         type=str,
-        default="/data/EHR_data_public/Renji",
+        default="/data/zikun_workspace/input/tables/renji/raw",
         help="Renji data root.",
     )
     parser.add_argument(
         "--splits",
         nargs="+",
-        default=["train", "test"],
+        default=["train", "val", "test"],
         help="Splits to harvest from root_dir/index.",
     )
     parser.add_argument(

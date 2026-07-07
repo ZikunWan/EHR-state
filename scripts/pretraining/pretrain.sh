@@ -8,7 +8,7 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py
     --root_dir "/data/zikun_workspace/mimic-iv-3.1_tabular" \
     --eicu_root_dir "/data/zikun_workspace/eicu-crd" \
     --eicu_processed_dir "/data/zikun_workspace/eicu-crd/processed" \
-    --ehrshot_root_dir "/data/EHR_data_public/EHRSHOT" \
+    --ehrshot_root_dir "/data/zikun_workspace/input/tables/ehrshot" \
     --table_text_embedding "/data/zikun_workspace/.cache/embeddings/mimic_iv/text_embeddings_stage2.pt" \
     --eicu_table_text_embedding "/data/zikun_workspace/.cache/embeddings/eicu/text_embeddings_stage2.pt" \
     --ehrshot_table_text_embedding "/data/zikun_workspace/.cache/embeddings/ehrshot/text_embeddings_stage2.pt" \

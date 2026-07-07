@@ -6,12 +6,12 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 python ./preprocess/precompute_phenotype_queries
     --num_discovery_workers 32 \
     --dataset mimic_iv eicu ehrshot \
     --root_dir "/data/zikun_workspace/mimic-iv-3.1_tabular" \
-    --sample_info_path "/data/zikun_workspace/mimic-iv-3.1_tabular/task_index/train/next_token_prediction.csv" \
+    --sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/index/train/next_token_prediction.csv" \
     --eicu_root_dir "/data/zikun_workspace/eicu-crd" \
     --eicu_processed_dir "/data/zikun_workspace/eicu-crd/processed" \
     --eicu_sample_info_path "/data/zikun_workspace/eicu-crd/processed/pretraining_index/sample_info_train.json" \
-    --ehrshot_root_dir "/data/EHR_data_public/EHRSHOT" \
-    --ehrshot_sample_info_path "/data/EHR_data_public/EHRSHOT/pretraining_index/sample_info_train.csv" \
+    --ehrshot_root_dir "/data/zikun_workspace/input/tables/ehrshot" \
+    --ehrshot_sample_info_path "/data/zikun_workspace/input/tables/ehrshot/pretraining_index/sample_info_train.csv" \
     --phenotype_spec_output_path "/data/zikun_workspace/.cache/phenotype_metric_learning/phenotype_query_specs.json" \
     --min_phenotype_occurrence 50 \
     --max_auto_phenotypes 256 \

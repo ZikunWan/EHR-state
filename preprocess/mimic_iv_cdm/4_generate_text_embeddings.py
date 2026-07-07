@@ -53,10 +53,11 @@ def collect_table_texts(df):
     return unique_texts
 
 
-def init_harvest_worker(root_dir, split, task_name):
+def init_harvest_worker(root_dir, index_dir, split, task_name):
     global _HARVEST_DATASET
     _HARVEST_DATASET = MIMICIVCDM(
         root_dir=root_dir,
+        index_dir=index_dir,
         split=split,
         task_name=task_name,
         lazy_mode=True,
@@ -101,7 +102,7 @@ def cleanup_harvest_parts(parts_dir):
         os.rmdir(parts_dir)
 
 
-def harvest_unique_texts(root_dir, splits, task_name, harvest_checkpoint, num_workers, num_harvest_chunks):
+def harvest_unique_texts(root_dir, index_dir, splits, task_name, harvest_checkpoint, num_workers, num_harvest_chunks):
     os.makedirs(os.path.dirname(harvest_checkpoint), exist_ok=True)
     parts_dir = f"{harvest_checkpoint}.parts"
     os.makedirs(parts_dir, exist_ok=True)
@@ -112,6 +113,7 @@ def harvest_unique_texts(root_dir, splits, task_name, harvest_checkpoint, num_wo
     for split in splits:
         dataset = MIMICIVCDM(
             root_dir=root_dir,
+            index_dir=index_dir,
             split=split,
             task_name=task_name,
             lazy_mode=True,
@@ -147,7 +149,7 @@ def harvest_unique_texts(root_dir, splits, task_name, harvest_checkpoint, num_wo
             with Pool(
                 processes=effective_workers,
                 initializer=init_harvest_worker,
-                initargs=(root_dir, split, task_name),
+                initargs=(root_dir, index_dir, split, task_name),
             ) as pool:
                 for part_idx, result in tqdm(
                     pool.imap_unordered(
@@ -331,8 +333,14 @@ def parse_args():
     parser.add_argument(
         "--splits",
         nargs="+",
-        default=["train", "val", "test"],
-        help="Splits to harvest from <root-dir>/index.",
+        default=["train", "test"],
+        help="Splits to harvest from index CSVs.",
+    )
+    parser.add_argument(
+        "--index-dir",
+        type=str,
+        default=None,
+        help="Directory containing mimiciv_cdm_<split>.csv. Defaults to <root-dir>/index.",
     )
     parser.add_argument(
         "--task-name",
@@ -394,6 +402,7 @@ def main():
         if rank == 0:
             harvest_unique_texts(
                 root_dir=args.root_dir,
+                index_dir=args.index_dir,
                 splits=args.splits,
                 task_name=args.task_name,
                 harvest_checkpoint=args.harvest_checkpoint,

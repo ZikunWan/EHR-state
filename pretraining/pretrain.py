@@ -28,21 +28,14 @@ sys.path.insert(0, project_root)
 from models.TableEncoder.adapter import QFormerAdapter
 from models.TableEncoder.config import LongTableEncoder1DConfig
 from models.TableEncoder.encoder import LongTableEncoder1D
+from models.encoder_classifier import QueryClassificationHead, query_classification_loss
 from models.next_token_decoder import NextTokenPredictionDecoder
 from models.query_attention import QueryCrossAttentionHead
-from utils.candidate_tasks import (
-    build_candidate_embedding_texts,
-    candidate_embedding_keys,
-    get_candidate_texts,
-)
 from utils.metrics import compute_classification_metrics
 
-try:
-    from . import phenotype_metric_learning as pml
-    from . import task_query_classification as tqc
-except ImportError:
-    import phenotype_metric_learning as pml
-    import task_query_classification as tqc
+
+import outdated.phenotype_metric_learning as pml
+import outdated.task_query_classification as tqc
 
 
 @dataclass
@@ -57,7 +50,7 @@ class DataArguments:
     eicu_processed_dir: str = field(
         default="/data/zikun_workspace/eicu-crd/processed"
     )
-    ehrshot_root_dir: str = field(default="/data/EHR_data_public/EHRSHOT")
+    ehrshot_root_dir: str = field(default="/data/zikun_workspace/input/tables/ehrshot")
     table_text_embedding: List[str] = field(
         default_factory=lambda: [
             "/data/zikun_workspace/.cache/embeddings/mimic_iv/"
@@ -459,8 +452,8 @@ class PreprocessedUnifiedTaskCollator:
         task_query_embeddings: Dict[str, torch.Tensor],
         content_task_names: List[str],
         format_query_embeddings: Dict[str, torch.Tensor],
-        task_candidate_embeddings: torch.Tensor,
-        task_candidate_mask: torch.Tensor,
+        task_class_query_embeddings: torch.Tensor,
+        task_class_query_mask: torch.Tensor,
         max_table_len: Optional[int],
         min_table_rows: int,
     ):
@@ -476,8 +469,8 @@ class PreprocessedUnifiedTaskCollator:
             ],
             dim=0,
         )
-        self.task_candidate_embeddings = task_candidate_embeddings.float()
-        self.task_candidate_mask = task_candidate_mask.float()
+        self.task_class_query_embeddings = task_class_query_embeddings.float()
+        self.task_class_query_mask = task_class_query_mask.float()
         self.max_table_len = max_table_len
         self.min_table_rows = min_table_rows
 
@@ -545,26 +538,26 @@ class PreprocessedUnifiedTaskCollator:
         content_task_id_tensor = torch.tensor(content_task_ids, dtype=torch.long)
         task_id_tensor = torch.tensor(task_ids, dtype=torch.long)
         task_type_id_tensor = torch.tensor(task_type_ids, dtype=torch.long)
-        table_tensors["content_query_embeds"] = self.content_query_embeddings.index_select(
+        content_query_embeds = self.content_query_embeddings.index_select(
             0, content_task_id_tensor
         )
-        table_tensors["format_query_embeds"] = self.format_query_embeddings.index_select(
+        format_query_embeds = self.format_query_embeddings.index_select(
             0, task_type_id_tensor
         )
-        table_tensors["query_embeds"] = (
-            table_tensors["content_query_embeds"]
-            + table_tensors["format_query_embeds"]
-        ) / math.sqrt(2.0)
+        query_embeds = self.task_class_query_embeddings.index_select(0, task_id_tensor)
+        query_mask = self.task_class_query_mask.index_select(0, task_id_tensor)
+        tte_rows = task_type_id_tensor == TASK_TYPE_TTE
+        if tte_rows.any():
+            query_embeds[tte_rows, 0] = (
+                content_query_embeds[tte_rows] + format_query_embeds[tte_rows]
+            ) / math.sqrt(2.0)
+            query_mask[tte_rows, 0] = 1.0
+        table_tensors["query_embeds"] = query_embeds
+        table_tensors["query_mask"] = query_mask
         table_tensors["labels"] = torch.tensor(labels, dtype=torch.float)
         table_tensors["task_loss_mask"] = torch.tensor(task_loss_masks, dtype=torch.float)
         table_tensors["task_ids"] = task_id_tensor
         table_tensors["task_type_ids"] = task_type_id_tensor
-        table_tensors["candidate_embeds"] = self.task_candidate_embeddings.index_select(
-            0, task_id_tensor
-        )
-        table_tensors["candidate_mask"] = self.task_candidate_mask.index_select(
-            0, task_id_tensor
-        )
         table_tensors["survival_labels"] = torch.stack(survival_labels)
         table_tensors["phenotype_values"] = torch.stack(phenotype_values)
         table_tensors["phenotype_mask"] = torch.stack(phenotype_masks)
@@ -616,9 +609,7 @@ class JointPretrainingModel(PreTrainedModel):
             time_loss_weight=training_args.ntp_time_loss_weight,
         )
         self.task_query_head = QueryCrossAttentionHead(config, query_dim=query_dim)
-        self.task_answer_projection = nn.Linear(query_dim, query_dim)
-        self.task_candidate_projection = nn.Linear(query_dim, query_dim)
-        self.task_logit_scale = nn.Parameter(torch.tensor(1.0))
+        self.task_classifier = QueryClassificationHead(query_dim=query_dim)
         self.task_survival_head = nn.Linear(query_dim, 365)
         self.register_buffer(
             "task_num_classes",
@@ -702,6 +693,9 @@ class JointPretrainingModel(PreTrainedModel):
 
     def forward_task_from_adapted(self, adapted, inputs):
         pooled = self.task_query_head(inputs["query_embeds"], adapted, None)
+        query_mask = inputs.get("query_mask")
+        if query_mask is not None:
+            query_mask = query_mask.to(pooled.device)
         task_type_ids = inputs.get("task_type_ids")
         if task_type_ids is None:
             task_type_ids = torch.zeros(
@@ -719,33 +713,21 @@ class JointPretrainingModel(PreTrainedModel):
         multiclass_mask = (task_type_ids == TASK_TYPE_MULTICLASS) & task_loss_mask
         classification_mask = binary_mask | multiclass_mask
 
-        answer_state = F.normalize(self.task_answer_projection(pooled), dim=-1)
-        candidate_state = F.normalize(
-            self.task_candidate_projection(
-                inputs["candidate_embeds"].to(pooled.device, pooled.dtype)
-            ),
-            dim=-1,
-        )
-        candidate_scores = torch.einsum("bd,bkd->bk", answer_state, candidate_state)
-        candidate_scores = candidate_scores * self.task_logit_scale.exp().clamp(max=100.0)
-        candidate_mask = inputs.get("candidate_mask")
-        if candidate_mask is not None:
-            candidate_scores = candidate_scores.masked_fill(
-                candidate_mask.to(candidate_scores.device) <= 0,
-                torch.finfo(candidate_scores.dtype).min,
-            )
+        task_logits = self.task_classifier(pooled)
+        binary_logits = task_logits[:, 0] if task_logits.dim() == 2 else task_logits
 
         loss_terms = []
         if binary_mask.any():
-            binary_loss = F.cross_entropy(
-                candidate_scores[binary_mask].float(),
-                labels[binary_mask].long(),
+            binary_loss = query_classification_loss(
+                binary_logits[binary_mask],
+                labels[binary_mask],
             )
             loss_terms.append(binary_loss)
         else:
             binary_loss = pooled.sum() * 0.0
 
-        survival_logits = self.task_survival_head(pooled)
+        pooled_primary = pooled[:, 0] if pooled.dim() == 3 else pooled
+        survival_logits = self.task_survival_head(pooled_primary)
         tte_mask = (task_type_ids == TASK_TYPE_TTE) & task_loss_mask
         if tte_mask.any():
             survival_labels = inputs["survival_labels"].to(
@@ -763,9 +745,11 @@ class JointPretrainingModel(PreTrainedModel):
             tte_loss = survival_logits.sum() * 0.0
 
         if multiclass_mask.any():
-            multiclass_loss = F.cross_entropy(
-                candidate_scores[multiclass_mask].float(),
+            multiclass_query_mask = query_mask[multiclass_mask] if query_mask is not None else None
+            multiclass_loss = query_classification_loss(
+                task_logits[multiclass_mask],
                 labels[multiclass_mask].long(),
+                query_mask=multiclass_query_mask,
             )
             loss_terms.append(multiclass_loss)
         else:
@@ -777,10 +761,10 @@ class JointPretrainingModel(PreTrainedModel):
             "binary_loss": binary_loss,
             "tte_loss": tte_loss,
             "multiclass_loss": multiclass_loss,
-            "logits": candidate_scores[:, :2],
-            "candidate_scores": candidate_scores,
+            "logits": binary_logits,
+            "task_logits": task_logits,
             "survival_logits": survival_logits,
-            "multiclass_logits": candidate_scores,
+            "multiclass_logits": task_logits,
             "labels": labels,
             "binary_mask": binary_mask,
             "classification_mask": classification_mask,
@@ -1245,45 +1229,45 @@ def load_cached_task_num_classes(cache_root: str, task_names: List[str]) -> List
     return [max(1, int(num_classes.get(task_name, 1))) for task_name in task_names]
 
 
-def task_candidate_texts(task_name: str, task_info: Dict[str, dict]) -> Optional[List[str]]:
+def task_class_labels(task_name: str, task_info: Dict[str, dict]) -> Optional[List[str]]:
     info = task_info.get(task_name)
     if not info:
         return None
-    if info.get("task_type") not in {
-        "binary_classification",
-        "multi_class_classification",
-    }:
+    if info.get("task_type") not in {"binary_classification", "multi_class_classification"}:
         return None
-    return get_candidate_texts(info)
+    return tqc.class_labels_for_task(info)
 
 
-def build_task_candidate_tensors(
+def build_task_class_query_tensors(
     task_names: List[str],
     task_info: Dict[str, dict],
     task_query_embeddings: Dict[str, torch.Tensor],
     query_dim: int,
 ):
-    candidates_by_task = {
-        task_name: task_candidate_texts(task_name, task_info)
+    labels_by_task = {
+        task_name: task_class_labels(task_name, task_info)
         for task_name in task_names
     }
-    max_candidates = max(
-        [1, *[len(candidates) for candidates in candidates_by_task.values() if candidates]]
+    max_queries = max(
+        [1, *[len(labels) for labels in labels_by_task.values() if labels]]
     )
-    candidate_embeddings = torch.zeros(
-        len(task_names), max_candidates, query_dim, dtype=torch.float
+    query_embeddings = torch.zeros(
+        len(task_names), max_queries, query_dim, dtype=torch.float
     )
-    candidate_mask = torch.zeros(len(task_names), max_candidates, dtype=torch.float)
+    query_mask = torch.zeros(len(task_names), max_queries, dtype=torch.float)
 
     for task_idx, task_name in enumerate(task_names):
-        candidate_texts = candidates_by_task.get(task_name)
-        if not candidate_texts:
+        class_labels = labels_by_task.get(task_name)
+        if not class_labels:
             continue
-        keys = candidate_embedding_keys(task_name, candidate_texts)
-        for candidate_idx, key in enumerate(keys):
-            candidate_embeddings[task_idx, candidate_idx] = task_query_embeddings[key].float()
-            candidate_mask[task_idx, candidate_idx] = 1.0
-    return candidate_embeddings, candidate_mask
+        if task_info[task_name].get("task_type") == "binary_classification":
+            keys = [task_name]
+        else:
+            keys = [tqc.class_query_key(task_name, class_label) for class_label in class_labels]
+        for query_idx, key in enumerate(keys):
+            query_embeddings[task_idx, query_idx] = task_query_embeddings[key].float()
+            query_mask[task_idx, query_idx] = 1.0
+    return query_embeddings, query_mask
 
 
 def main():
@@ -1312,16 +1296,10 @@ def main():
         for task_name in content_task_names
     }
     for task_name in task_names:
-        candidate_texts = task_candidate_texts(task_name, task_info)
-        if not candidate_texts:
+        info = task_info.get(task_name)
+        if not info or info.get("task_type") not in {"binary_classification", "multi_class_classification"}:
             continue
-        task_query_texts.update(
-            build_candidate_embedding_texts(
-                task_name,
-                task_info[task_name]["instruction"],
-                candidate_texts,
-            )
-        )
+        task_query_texts.update(tqc.build_class_query_texts(task_name, info))
     task_query_texts.update(FORMAT_QUERY_TEXTS)
     task_query_embeddings = pml.build_knowledge_query_embeddings(
         query_texts=task_query_texts,
@@ -1367,7 +1345,7 @@ def main():
             f"joint pretraining: task={task_query_dim}, "
             f"phenotype={phenotype_query_dim}"
         )
-    task_candidate_embeddings, task_candidate_mask = build_task_candidate_tensors(
+    task_class_query_embeddings, task_class_query_mask = build_task_class_query_tensors(
         task_names=task_names,
         task_info=task_info,
         task_query_embeddings=task_query_embeddings,
@@ -1406,8 +1384,8 @@ def main():
         task_query_embeddings=task_query_embeddings,
         content_task_names=content_task_names,
         format_query_embeddings=task_query_embeddings,
-        task_candidate_embeddings=task_candidate_embeddings,
-        task_candidate_mask=task_candidate_mask,
+        task_class_query_embeddings=task_class_query_embeddings,
+        task_class_query_mask=task_class_query_mask,
         max_table_len=data_args.max_table_len,
         min_table_rows=data_args.min_table_rows,
     )

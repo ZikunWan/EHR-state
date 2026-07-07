@@ -1,5 +1,5 @@
 """
-Generate train/test splits for Renji dataset using labels.csv.
+Generate train/val/test splits for Renji dataset using labels.csv.
 Uses multilabel stratified splitting based on label distribution.
 """
 import os
@@ -10,40 +10,29 @@ import pandas as pd
 from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 
 
-DEFAULT_DATA_DIR = "/data/EHR_data_public/Renji"
-DEFAULT_SAVE_DIR = "/data/EHR_data_public/Renji/index"
+DEFAULT_DATA_DIR = "/data/zikun_workspace/input/tables/renji/raw"
+DEFAULT_SAVE_DIR = f"{DEFAULT_DATA_DIR}/index"
 
 LABEL_WINDOWS = ["0-30d", "30-180d", "180-365d", "365d+"]
 
-# Target metrics
-TARGET_METRICS = [
+# Target label names as they appear in labels.csv.
+TARGET_LABEL_METRICS = [
     "ALB",
     "ALP",
-    "ALT",
-    "AST",
-    "CMV-DNA",
     "CR",
-    "DB",
-    "EBV-DNA",
-    "HBV-DNA",
+    "血糖",
     "HB",
     "INR",
     "N(%)",
     "PLT",
     "PT",
-    "TB",
     "TP",
     "WBC",
-    "γ-GT",
-    "他克莫司浓度",
     "尿酸",
-    "总胆固醇",
-    "淋巴细胞绝对值",
-    "环孢素峰浓度",
-    "环孢素谷浓度",
-    "甘油三脂",
-    "胆汁酸",
-    "血糖",
+]
+SURVIVAL_TARGETS = [
+    "death_survival",
+    "tacrolimus_abnormal_survival",
 ]
 
 DEV_SAMPLE_SIZE = None  # Set to integer for quick testing
@@ -57,11 +46,14 @@ def get_label_fingerprints(labels_df):
     target_cols = []
     
     # Identify all valid target columns that exist in the dataframe
-    for m in TARGET_METRICS:
+    for m in TARGET_LABEL_METRICS:
         for w in LABEL_WINDOWS:
             col_name = f"{w}_{m}"
             if col_name in labels_df.columns:
                 target_cols.append(col_name)
+    for col_name in SURVIVAL_TARGETS:
+        if col_name in labels_df.columns:
+            target_cols.append(col_name)
     
     print(f"Using {len(target_cols)} individual label columns for stratification.")
     
@@ -73,14 +65,55 @@ def get_label_fingerprints(labels_df):
     return y, target_cols
 
 
+def random_train_val_test_split(num_samples, test_size, val_size, random_state):
+    indices = np.arange(num_samples)
+    rng = np.random.default_rng(random_state)
+    rng.shuffle(indices)
+
+    test_count = int(round(num_samples * test_size))
+    val_count = int(round(num_samples * val_size))
+    test_count = min(max(test_count, 1), num_samples - 2)
+    val_count = min(max(val_count, 1), num_samples - test_count - 1)
+
+    test_idx = indices[:test_count]
+    val_idx = indices[test_count:test_count + val_count]
+    train_idx = indices[test_count + val_count:]
+    return train_idx, val_idx, test_idx
+
+
+def stratified_train_val_test_split(indices, y, test_size, val_size, random_state):
+    msss_test = MultilabelStratifiedShuffleSplit(
+        n_splits=1,
+        test_size=test_size,
+        random_state=random_state,
+    )
+    train_val_idx, test_idx = next(msss_test.split(indices, y))
+
+    relative_val_size = val_size / (1.0 - test_size)
+    relative_val_size = min(max(relative_val_size, 1.0 / len(train_val_idx)), 0.5)
+    msss_val = MultilabelStratifiedShuffleSplit(
+        n_splits=1,
+        test_size=relative_val_size,
+        random_state=random_state,
+    )
+    train_rel_idx, val_rel_idx = next(
+        msss_val.split(train_val_idx, y[train_val_idx])
+    )
+    train_idx = train_val_idx[train_rel_idx]
+    val_idx = train_val_idx[val_rel_idx]
+    return train_idx, val_idx, test_idx
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate Renji dataset train/test splits.")
+    parser = argparse.ArgumentParser(description="Generate Renji dataset train/val/test splits.")
     parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR, 
                         help="Directory containing labels.csv")
     parser.add_argument("--save_dir", type=str, default=DEFAULT_SAVE_DIR, 
                         help="Directory to save split JSON files.")
     parser.add_argument("--test_size", type=float, default=0.2,
                         help="Test set ratio (default: 0.2)")
+    parser.add_argument("--val_size", type=float, default=0.1,
+                        help="Validation set ratio over all patients (default: 0.1)")
     parser.add_argument("--dev_sample", type=int, default=DEV_SAMPLE_SIZE, 
                         help="Size of dev set for testing (optional).")
     parser.add_argument("--random_state", type=int, default=42,
@@ -115,11 +148,6 @@ def main():
     # Handle edge case: if all fingerprints are zero, just do random split
     if y.sum() == 0:
         print("Warning: No positive labels found, using random split")
-        np.random.seed(args.random_state)
-        np.random.shuffle(indices)
-        split_point = int(len(indices) * (1 - args.test_size))
-        train_idx = indices[:split_point]
-        test_idx = indices[split_point:]
     else:
         # Downsampling for dev if requested
         if args.dev_sample is not None and args.dev_sample < len(filenames):
@@ -141,27 +169,39 @@ def main():
             
             print(f"Development set size: {len(filenames)}")
 
-        # 3. Stratified Split (train/test only)
-        msss = MultilabelStratifiedShuffleSplit(
-            n_splits=1, 
-            test_size=args.test_size, 
-            random_state=args.random_state
+        train_idx, val_idx, test_idx = stratified_train_val_test_split(
+            indices,
+            y,
+            args.test_size,
+            args.val_size,
+            args.random_state,
         )
-        train_idx, test_idx = next(msss.split(indices, y))
     
-    print(f"Split Result: Train={len(train_idx)}, Test={len(test_idx)}")
+    if y.sum() == 0:
+        train_idx, val_idx, test_idx = random_train_val_test_split(
+            len(filenames),
+            args.test_size,
+            args.val_size,
+            args.random_state,
+        )
+    
+    print(f"Split Result: Train={len(train_idx)}, Val={len(val_idx)}, Test={len(test_idx)}")
     
     # 4. Save Results
     train_files = [filenames[i] for i in train_idx]
+    val_files = [filenames[i] for i in val_idx]
     test_files = [filenames[i] for i in test_idx]
     
     # 4.1. all_valid_renji.json (Complete dictionary)
     split_data = {
         "train_files": train_files,
+        "val_files": val_files,
         "test_files": test_files,
         "train_indices": train_idx.tolist(),
+        "val_indices": val_idx.tolist(),
         "test_indices": test_idx.tolist(),
         "total_patients": len(filenames),
+        "val_size": args.val_size,
         "test_size": args.test_size,
         "random_state": args.random_state
     }
@@ -177,7 +217,13 @@ def main():
         json.dump(train_files, f, indent=4, ensure_ascii=False)
     print(f"Saved: {save_path_train}")
 
-    # 4.3. test_renji.json
+    # 4.3. val_renji.json
+    save_path_val = os.path.join(args.save_dir, "val_renji.json")
+    with open(save_path_val, "w", encoding='utf-8') as f:
+        json.dump(val_files, f, indent=4, ensure_ascii=False)
+    print(f"Saved: {save_path_val}")
+
+    # 4.4. test_renji.json
     save_path_test = os.path.join(args.save_dir, "test_renji.json")
     with open(save_path_test, "w", encoding='utf-8') as f:
         json.dump(test_files, f, indent=4, ensure_ascii=False)
@@ -186,14 +232,16 @@ def main():
     # Print label distribution stats
     print("\n--- Label Distribution ---")
     train_y = y[train_idx]
+    val_y = y[val_idx]
     test_y = y[test_idx]
     
-    for i, metric in enumerate(TARGET_METRICS[:10]):  # Show first 10
+    for i, metric in enumerate(target_cols[:10]):  # Show first 10
         train_pos = train_y[:, i].sum()
+        val_pos = val_y[:, i].sum()
         test_pos = test_y[:, i].sum()
-        print(f"  {metric}: Train={train_pos}, Test={test_pos}")
-    if len(TARGET_METRICS) > 10:
-        print(f"  ... and {len(TARGET_METRICS) - 10} more metrics")
+        print(f"  {metric}: Train={train_pos}, Val={val_pos}, Test={test_pos}")
+    if len(target_cols) > 10:
+        print(f"  ... and {len(target_cols) - 10} more labels")
 
 
 if __name__ == "__main__":
