@@ -4,14 +4,37 @@ import torch
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
 
+def repeat_kv(hidden_states, repeats: int):
+    if repeats == 1:
+        return hidden_states
+    return hidden_states.repeat_interleave(repeats, dim=1)
+
+
 class FlashAttention(nn.Module):
-    def __init__(self, dim, num_heads=12, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    def __init__(
+        self,
+        dim,
+        num_heads=12,
+        num_key_value_heads=None,
+        qkv_bias=False,
+        attn_drop=0.,
+        proj_drop=0.,
+    ):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.num_key_value_heads = num_key_value_heads or num_heads
+        if num_heads % self.num_key_value_heads != 0:
+            raise ValueError("num_heads must be divisible by num_key_value_heads")
+        self.num_key_value_groups = num_heads // self.num_key_value_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        if self.num_key_value_heads == self.num_heads:
+            self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        else:
+            self.q_proj = nn.Linear(dim, num_heads * self.head_dim, bias=qkv_bias)
+            self.k_proj = nn.Linear(dim, self.num_key_value_heads * self.head_dim, bias=qkv_bias)
+            self.v_proj = nn.Linear(dim, self.num_key_value_heads * self.head_dim, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -30,9 +53,23 @@ class FlashAttention(nn.Module):
 
         batch_size, seq_len, hidden_dim = x.shape
 
-        # [batch_size, seq_len, 3, num_heads, head_dim] -> [3, batch_size, num_heads, seq_len, head_dim]
-        qkv = self.qkv(x).contiguous().reshape(batch_size, seq_len, 3, self.num_heads, hidden_dim // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        if self.num_key_value_heads == self.num_heads:
+            qkv = self.qkv(x).contiguous().reshape(
+                batch_size, seq_len, 3, self.num_heads, self.head_dim
+            ).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+        else:
+            q = self.q_proj(x).contiguous().view(
+                batch_size, seq_len, self.num_heads, self.head_dim
+            ).transpose(1, 2)
+            k = self.k_proj(x).contiguous().view(
+                batch_size, seq_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+            v = self.v_proj(x).contiguous().view(
+                batch_size, seq_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+            k = repeat_kv(k, self.num_key_value_groups)
+            v = repeat_kv(v, self.num_key_value_groups)
 
         # Handle mask for SDPA
         # Use float mask (-inf for masked positions, 0.0 for valid) instead of bool,
@@ -173,10 +210,16 @@ class FeedForward(nn.Module):
         return x
 
 class StandardTransformerLayer(nn.Module):
-    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0, kv_heads=None):
         super().__init__()
         self.norm1 = RMSNorm(dim)
-        self.attn = FlashAttention(dim, num_heads=heads, attn_drop=dropout, proj_drop=dropout)
+        self.attn = FlashAttention(
+            dim,
+            num_heads=heads,
+            num_key_value_heads=kv_heads,
+            attn_drop=dropout,
+            proj_drop=dropout,
+        )
         self.norm2 = RMSNorm(dim)
         self.ffn = FeedForward(dim, mlp_dim, dropout)
 

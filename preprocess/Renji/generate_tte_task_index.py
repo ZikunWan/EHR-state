@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""Generate Renji time-to-event index files for survival tasks."""
-
 from __future__ import annotations
 
 import argparse

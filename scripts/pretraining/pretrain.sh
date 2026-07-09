@@ -3,26 +3,27 @@ set -euo pipefail
 source "$(dirname "$0")/../common/silent_info.sh"
 
 MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py \
-    --deepspeed "./ds_config_zero2.json" \
+    --deepspeed "./ds_config_zero3.json" \
     --dataset mimic_iv eicu ehrshot \
     --root_dir "/data/zikun_workspace/mimic-iv-3.1_tabular" \
     --eicu_root_dir "/data/zikun_workspace/eicu-crd" \
     --eicu_processed_dir "/data/zikun_workspace/eicu-crd/processed" \
     --ehrshot_root_dir "/data/zikun_workspace/input/tables/ehrshot" \
-    --table_text_embedding "/data/zikun_workspace/.cache/embeddings/mimic_iv/text_embeddings_stage2.pt" \
-    --eicu_table_text_embedding "/data/zikun_workspace/.cache/embeddings/eicu/text_embeddings_stage2.pt" \
-    --ehrshot_table_text_embedding "/data/zikun_workspace/.cache/embeddings/ehrshot/text_embeddings_stage2.pt" \
-    --phenotype_spec_path "/data/zikun_workspace/.cache/phenotype_metric_learning/phenotype_query_specs.json" \
-    --unified_preprocessed_input_dir "/data/zikun_workspace/.cache/unified_pretraining/inputs" \
-    --task_query_embedding_cache "/data/zikun_workspace/.cache/embeddings/pretrain/task_query_knowledge_embeddings.pt" \
-    --phenotype_query_embedding_cache "/data/zikun_workspace/.cache/embeddings/pretrain/phenotype_query_knowledge_embeddings.pt" \
-    --knowledge_encoder_path "/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/clinicalBERT_after_stage2/best.pt" \
+    --table_text_embedding "/data/zikun_workspace/input/cache/embeddings/mimic_iv/text_embeddings.pt" \
+    --eicu_table_text_embedding "/data/zikun_workspace/input/cache/embeddings/eicu/text_embeddings.pt" \
+    --ehrshot_table_text_embedding "/data/zikun_workspace/input/cache/embeddings/ehrshot/text_embeddings.pt" \
+    --merged_table_embedding_cache "/data/zikun_workspace/input/cache/embeddings/merged_table_embeddings.pt" \
+    --phenotype_spec_path "/data/zikun_workspace/input/cache/pretraining/phenotype_metric_learning/phenotype_query_specs.json" \
+    --pretraining_input_dir "/data/zikun_workspace/input/cache/pretraining/ehr_encoder/inputs" \
+    --task_query_embedding_cache "/data/zikun_workspace/input/cache/query_embeddings/pretraining/task_query_knowledge_embeddings.pt" \
+    --phenotype_query_embedding_cache "/data/zikun_workspace/input/cache/query_embeddings/pretraining/phenotype_query_knowledge_embeddings.pt" \
+    --knowledge_encoder_path "/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/best.pt" \
     --knowledge_encoder_base_model_path "/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT" \
     --query_max_length 64 \
     --query_embedding_batch_size 256 \
-    --max_table_len 4096 \
+    --max_table_len 2048 \
     --min_table_rows 2 \
-    --per_device_train_batch_size 50 \
+    --per_device_train_batch_size 32 \
     --per_device_eval_batch_size 32 \
     --gradient_accumulation_steps 1 \
     --dataloader_num_workers 4 \
@@ -52,5 +53,5 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py
     --bf16 true \
     --report_to "wandb" \
     --wandb_project "Joint_Pretraining" \
-    --run_name "unified_task_anchored_joint_pretrain" \
-    --output_dir "/data/zikun_workspace/checkpoints/pretraining/joint"
+    --run_name "1B_pretrain" \
+    --output_dir "/data/zikun_workspace/checkpoints/pretraining/1B"

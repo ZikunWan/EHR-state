@@ -402,13 +402,13 @@ def parse_args():
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/data/zikun_workspace/.cache/embeddings/mimic_iv",
+        default="/data/zikun_workspace/input/cache/embeddings/mimic_iv",
         help="Embedding cache dir.",
     )
     parser.add_argument(
         "--harvest-checkpoint",
         type=str,
-        default="/data/zikun_workspace/.cache/embeddings/mimic_iv/train_unique_texts.pkl",
+        default="",
         help="Unique text checkpoint. Defaults to <cache-dir>/unique_texts_harvested.pkl.",
     )
     parser.add_argument(

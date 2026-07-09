@@ -8,11 +8,12 @@ class _BaseTableEncoderConfig(PretrainedConfig):
         self,
         # Core dimensions for input text embeddings and transformer hidden states.
         text_dim: int = 768,
-        dim: int = 768,
-        depth: int = 6,
-        heads: int = 12,
+        dim: int = 1536,
+        depth: int = 40,
+        heads: int = 24,
+        kv_heads: Optional[int] = 8,
         dim_head: int = 64,
-        mlp_dim: int = 3072,
+        mlp_dim: int = 6144,
         dropout: float = 0.0,
 
         # Output adapter: allocate at most max_queries, about one query per tokens_per_query rows.
@@ -40,11 +41,20 @@ class _BaseTableEncoderConfig(PretrainedConfig):
             raise ValueError("tokens_per_query must be positive")
         if max_table_len is not None and max_table_len <= 0:
             raise ValueError("max_table_len must be positive when set")
+        if kv_heads is None:
+            kv_heads = heads
+        if heads <= 0:
+            raise ValueError("heads must be positive")
+        if kv_heads <= 0:
+            raise ValueError("kv_heads must be positive")
+        if heads % kv_heads != 0:
+            raise ValueError("heads must be divisible by kv_heads for grouped-query attention")
 
         self.text_dim = text_dim
         self.dim = dim
         self.depth = depth
         self.heads = heads
+        self.kv_heads = kv_heads
         self.dim_head = dim_head
         self.mlp_dim = mlp_dim
         self.dropout = dropout

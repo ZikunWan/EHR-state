@@ -29,7 +29,7 @@ deepspeed --include localhost:4,5,6,7 train/tte/train_renji_survival.py \
     --bf16 true \
     --dataloader_num_workers 32 \
     --report_to wandb \
-    --query_embedding_cache "/data/zikun_workspace/.cache/embeddings/query_candidate/renji_survival_task_query_knowledge_embeddings.pt" \
+    --query_embedding_cache "/data/zikun_workspace/input/cache/query_embeddings/query_candidate/renji_survival_task_query_knowledge_embeddings.pt" \
     --knowledge_encoder_path "/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/clinicalBERT_after_stage2/best.pt" \
     --knowledge_encoder_base_model_path "/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT" \
     --query_max_length 128 \

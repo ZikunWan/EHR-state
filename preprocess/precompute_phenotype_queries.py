@@ -25,7 +25,7 @@ class PrecomputeArguments:
     stage: str = field(default="discover")
     num_discovery_workers: int = field(default=32)
     phenotype_spec_output_path: str = field(
-        default="/data/zikun_workspace/.cache/phenotype_metric_learning/phenotype_query_specs.json"
+        default="/data/zikun_workspace/input/cache/pretraining/phenotype_metric_learning/phenotype_query_specs.json"
     )
 
 
@@ -73,13 +73,22 @@ def encode_queries_distributed(data_args: DataArguments, precompute_args: Precom
     query_specs = load_query_specs(precompute_args.phenotype_spec_output_path)
     query_texts = {spec.key: spec.query_text for spec in query_specs}
     cached_embeddings = {}
+    cached_query_texts = {}
     if os.path.exists(data_args.query_embedding_cache):
         cache = torch.load(data_args.query_embedding_cache, map_location="cpu", weights_only=False)
         cached_embeddings.update(
             {key: value.float() for key, value in cache.get("embeddings", {}).items()}
         )
+        cached_query_texts.update(
+            {str(key): str(value) for key, value in cache.get("query_texts", {}).items()}
+        )
 
-    missing_keys = sorted(set(query_texts) - set(cached_embeddings))
+    missing_keys = sorted(
+        key
+        for key in query_texts
+        if key not in cached_embeddings
+        or cached_query_texts.get(key) != query_texts[key]
+    )
     local_keys = missing_keys[rank::world_size]
     local_embeddings = encode_knowledge_query_texts(
         query_texts={key: query_texts[key] for key in local_keys},
@@ -118,6 +127,7 @@ def encode_queries_distributed(data_args: DataArguments, precompute_args: Precom
                 "text_dim": int(next(iter(embeddings.values())).numel()),
                 "model_path": data_args.knowledge_encoder_path,
                 "base_model_path": data_args.knowledge_encoder_base_model_path,
+                "query_texts": query_texts,
             },
             tmp_path,
         )

@@ -46,7 +46,7 @@ class ModelArguments:
 class DataArguments:
     data_dir: str = field(default="/data/zikun_workspace/input/tables/renji/raw")
     embedding_cache: str = field(
-        default="/data/zikun_workspace/.cache/embeddings/renji/text_embeddings_stage2.pt"
+        default="/data/zikun_workspace/input/cache/embeddings/renji/text_embeddings_stage2.pt"
     )
     checkpoint_dir: str = field(
         default="/data/zikun_workspace/checkpoints/renji/tacrolimus_survival"
@@ -62,7 +62,7 @@ class DataArguments:
     )
     type_vocab_file: str = field(default="data/type_vocab.json")
     query_embedding_cache: str = field(
-        default="/data/zikun_workspace/.cache/embeddings/query_candidate/"
+        default="/data/zikun_workspace/input/cache/query_embeddings/query_candidate/"
         "renji_survival_task_query_knowledge_embeddings.pt"
     )
     knowledge_encoder_path: str = field(

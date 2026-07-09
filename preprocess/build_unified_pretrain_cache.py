@@ -1,51 +1,50 @@
 import json
+import hashlib
+import math
 import multiprocessing as mp
 import os
 import queue
+import re
 import shutil
 import sys
-import traceback
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from glob import glob
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 from transformers import HfArgumentParser
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from outdated import phenotype_metric_learning as pml
-from outdated import task_query_classification as tqc
-
+from dataset.ehrshot.ehrshot_dataset import EHRSHOTDataset
+from dataset.ehrshot.task_info import get_task_info as get_ehrshot_task_info
+from dataset.eicu.eicu_dataset import EICUDataset
+from dataset.eicu.task_info import get_task_info as get_eicu_task_info
+from dataset.mimic.mimic_dataset import MIMICIV
+from dataset.mimic.task_info import get_task_info as get_mimic_task_info
+from dataset.mimic_iv_cdm.task_info import get_task_info as get_mimic_iv_cdm_task_info
+from dataset.pds.task_info import get_task_info as get_pds_task_info
+from dataset.renji.task_info import get_task_info as get_renji_task_info
 from utils.collate import build_table_token_tensors
+from utils.load_embedding import build_text_to_idx
 
 
-FORMAT_VERSION = 5
-TASK_TYPE_BINARY = 0
-TASK_TYPE_TTE = 1
-TASK_TYPE_MULTICLASS = 2
-PRETRAINING_CONTEXT_TASK = "__pretraining_context__"
-MAX_TTE_BINS = 365
-_WORKER_DATASET = None
-_WORKER_SOURCE_REGISTRY = None
-_WORKER_INPUT_RECORDS = None
-_WORKER_TASK_TO_ID = None
-_WORKER_CONTENT_TASK_TO_ID = None
-_WORKER_EXTRACTOR = None
-_WORKER_TEXT_TO_IDX = None
-_WORKER_TYPE_VOCAB = None
-_WORKER_MIN_TABLE_ROWS = 2
-_WORKER_TORCH_THREADS = 1
-_WORKER_SPLIT_DIR = None
-_WORKER_RUN_ID = None
-_WORKER_NUM_PHENOTYPES = None
-_WORKER_PROGRESS_QUEUE = None
-_WORKER_PROGRESS_UPDATE_INTERVAL = 128
+sequence_dtypes = {
+    "item_ids": np.int32,
+    "unit_ids": np.int32,
+    "value_text_ids": np.int32,
+    "times": np.float32,
+    "numeric_values": np.float32,
+    "numeric_mask": np.uint8,
+    "type_ids": np.int32,
+}
+worker_state = {}
 
 
 @dataclass
@@ -63,20 +62,20 @@ class CacheBuildArguments:
     ehrshot_root_dir: str = field(default="/data/zikun_workspace/input/tables/ehrshot")
     table_text_embedding: List[str] = field(
         default_factory=lambda: [
-            "/data/zikun_workspace/.cache/embeddings/mimic_iv/"
-            "text_embeddings_stage2.pt"
+            "/data/zikun_workspace/input/cache/embeddings/mimic_iv/"
+            "text_embeddings.pt"
         ]
     )
     eicu_table_text_embedding: List[str] = field(
         default_factory=lambda: [
-            "/data/zikun_workspace/.cache/embeddings/eicu/"
-            "text_embeddings_stage2.pt"
+            "/data/zikun_workspace/input/cache/embeddings/eicu/"
+            "text_embeddings.pt"
         ]
     )
     ehrshot_table_text_embedding: List[str] = field(
         default_factory=lambda: [
-            "/data/zikun_workspace/.cache/embeddings/ehrshot/"
-            "text_embeddings_stage2.pt"
+            "/data/zikun_workspace/input/cache/embeddings/ehrshot/"
+            "text_embeddings.pt"
         ]
     )
     type_vocab_file: str = field(
@@ -121,21 +120,20 @@ class CacheBuildArguments:
     include_pretraining_context: bool = field(default=True)
     tte_index_dir: str = field(default="/data/zikun_workspace/input/tasks/time_to_event")
     phenotype_spec_path: str = field(
-        default="/data/zikun_workspace/.cache/phenotype_metric_learning/"
+        default="/data/zikun_workspace/input/cache/pretraining/phenotype_metric_learning/"
         "phenotype_query_specs.json"
     )
     output_dir: str = field(
-        default="/data/zikun_workspace/.cache/unified_pretraining/inputs"
+        default="/data/zikun_workspace/input/cache/pretraining/ehr_encoder/inputs"
     )
     min_table_rows: int = field(default=2)
     part_size: int = field(default=2048)
     num_workers: int = field(default=1)
-    worker_chunksize: int = field(default=8)
     worker_torch_threads: int = field(default=1)
     worker_max_tasks_per_child: int = field(default=0)
     worker_progress_update_interval: int = field(default=128)
     supervision_write_buffer_size: int = field(default=8192)
-    run_id: str = field(default="unified_pretrain_cache_v5")
+    run_id: str = field(default="pretraining_cache_v5")
     resume: bool = field(default=True)
 
 
@@ -153,9 +151,475 @@ def embedding_cache_paths(args: CacheBuildArguments) -> List[str]:
     return paths
 
 
+risk_prediction_tasks = [
+    "ED_Hospitalization",
+    "ED_Inpatient_Mortality",
+    "ED_ICU_Tranfer_12hour",
+    "ED_Reattendance_3day",
+    "ED_Critical_Outcomes",
+    "Readmission_30day",
+    "Readmission_60day",
+    "Inpatient_Mortality",
+    "LengthOfStay_3day",
+    "LengthOfStay_7day",
+    "ICU_Mortality_1day",
+    "ICU_Mortality_2day",
+    "ICU_Mortality_3day",
+    "ICU_Mortality_7day",
+    "ICU_Mortality_14day",
+    "ICU_Stay_7day",
+    "ICU_Stay_14day",
+    "ICU_Readmission",
+]
+
+
+def resolve_sample_info_paths(path_arg: str):
+    paths = []
+    for raw_path in path_arg.split(","):
+        path = raw_path.strip()
+        if not path:
+            continue
+        if os.path.isdir(path):
+            for task_name in risk_prediction_tasks:
+                csv_path = os.path.join(path, f"{task_name}.csv")
+                if os.path.exists(csv_path):
+                    paths.append(csv_path)
+        else:
+            paths.append(path)
+    return paths
+
+
+def get_task_info():
+    task_info = {}
+    task_info.update(get_mimic_task_info())
+    task_info.update(get_eicu_task_info())
+    task_info.update(get_ehrshot_task_info())
+    task_info.update(get_mimic_iv_cdm_task_info())
+    task_info.update(get_pds_task_info())
+    task_info.update(get_renji_task_info())
+    return task_info
+
+
+def binary_task_names(task_info: dict):
+    return sorted(
+        task_name
+        for task_name, info in task_info.items()
+        if info["task_type"] == "binary_classification"
+    )
+
+
+def parse_binary_label(value) -> int:
+    label = str(value).strip().strip('"').strip("'").strip().lower()
+    if label in {"true", "yes"}:
+        return 1
+    if label in {"false", "no"}:
+        return 0
+    return int(float(label))
+
+
+def build_mimic_datasets(root_dir: str, sample_info_paths):
+    return [
+        (
+            "mimic_iv",
+            MIMICIV(
+                root_dir=root_dir,
+                sample_info_path=sample_info_path,
+                lazy_mode=True,
+                shuffle=False,
+                max_samples=None,
+                use_table_length_cache=False,
+            ),
+        )
+        for sample_info_path in sample_info_paths
+    ]
+
+
+def build_eicu_datasets(root_dir: str, processed_dir: str, sample_info, task_names):
+    return [
+        (
+            "eicu",
+            EICUDataset(
+                root_dir=root_dir,
+                processed_dir=processed_dir,
+                sample_info=sample_info,
+                task_name=task_name,
+                lazy_mode=True,
+                shuffle=False,
+            ),
+        )
+        for task_name in task_names
+    ]
+
+
+def build_ehrshot_datasets(root_dir: str, sample_info, task_names):
+    return [
+        (
+            "ehrshot",
+            EHRSHOTDataset(
+                root_dir=root_dir,
+                sample_info=sample_info,
+                task_name=task_name,
+                lazy_mode=True,
+            ),
+        )
+        for task_name in task_names
+    ]
+
+
+class TaskQueryDataset(Dataset):
+    def __init__(self, datasets, max_samples: Optional[int]):
+        self.datasets = datasets
+        self.index = []
+        if max_samples is not None:
+            positions = [0] * len(self.datasets)
+            while len(self.index) < max_samples:
+                added = False
+                for dataset_idx, (_, dataset) in enumerate(self.datasets):
+                    if positions[dataset_idx] < len(dataset):
+                        self.index.append((dataset_idx, positions[dataset_idx]))
+                        positions[dataset_idx] += 1
+                        added = True
+                        if len(self.index) >= max_samples:
+                            break
+                if not added:
+                    break
+        else:
+            for dataset_idx, (_, dataset) in enumerate(self.datasets):
+                for sample_idx in range(len(dataset)):
+                    self.index.append((dataset_idx, sample_idx))
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        dataset_idx, sample_idx = self.index[idx]
+        dataset_name, dataset = self.datasets[dataset_idx]
+        sample = dataset[sample_idx]
+        sample_info = dataset.sample_info[sample_idx]
+        if dataset_name == "mimic_iv":
+            task_name = sample_info["task"]
+            label = sample_info["target"]
+        else:
+            task_name = sample_info["task_name"]
+            label = sample["output"]
+        return {
+            "table": sample["measurement_table"],
+            "task": task_name,
+            "label": parse_binary_label(label),
+        }
+
+    def task_names(self):
+        tasks = set()
+        for dataset_idx, sample_idx in self.index:
+            dataset_name, dataset = self.datasets[dataset_idx]
+            sample_info = dataset.sample_info[sample_idx]
+            if dataset_name == "mimic_iv":
+                tasks.add(str(sample_info["task"]))
+            else:
+                tasks.add(str(sample_info["task_name"]))
+        return sorted(tasks)
+
+
+@dataclass
+class PhenotypeQuerySpec:
+    key: str
+    item: str
+    query_text: str
+    aliases: List[str] = field(default_factory=list)
+    statistic: str = "latest"
+    unit: str = ""
+    description: str = ""
+    normal_range: str = ""
+    window_name: str = "full encounter"
+    window_start_hours: Optional[float] = None
+    window_end_hours: Optional[float] = None
+    category_regex: str = "^measurement$"
+    item_regex: Optional[str] = None
+    transform: str = "none"
+    mean: Optional[float] = None
+    scale: Optional[float] = None
+
+
+def load_type_vocab(path: str) -> Dict[str, int]:
+    with open(path, "r", encoding="utf-8") as f:
+        return {str(key): int(value) for key, value in json.load(f).items()}
+
+
+def ordered_table_vocab_keys(texts: Iterable[str]) -> List[str]:
+    text_set = {str(text) for text in texts}
+    ordered = ["[PAD]"] if "[PAD]" in text_set else []
+    ordered.extend(sorted(text for text in text_set if text != "[PAD]"))
+    return ordered
+
+
+def load_table_text_to_idx(cache_paths: List[str]):
+    vocab_keys = set()
+    text_dim = None
+    for cache_path in cache_paths:
+        data = torch.load(cache_path, map_location="cpu", weights_only=False)
+        for text in data["embeddings"]:
+            vocab_keys.add(str(text))
+        text_dim = int(data["text_dim"])
+        print(f"Loaded {len(data['embeddings'])} table vocabulary entries from {cache_path}")
+    if text_dim is None:
+        raise ValueError("No table text embeddings loaded.")
+    return text_dim, build_text_to_idx(ordered_table_vocab_keys(vocab_keys))
+
+
+def phenotype_spec_fingerprint(query_specs: List[PhenotypeQuerySpec]) -> str:
+    payload = json.dumps(
+        [asdict(spec) for spec in query_specs],
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def text_vocab_fingerprint(text_to_idx: Dict[str, int]) -> str:
+    digest = hashlib.sha256()
+    for text, idx in sorted(text_to_idx.items(), key=lambda item: item[1]):
+        encoded = str(text).encode("utf-8")
+        digest.update(int(idx).to_bytes(8, byteorder="little", signed=False))
+        digest.update(len(encoded).to_bytes(8, byteorder="little", signed=False))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def sanitize_key(text: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", "_", str(text).strip().lower()).strip("_")
+    return text or "phenotype"
+
+
+def build_query_text(spec: Dict[str, Any]) -> str:
+    parts = [f"Continuous clinical measurement: {spec.get('item', '')}."]
+    if spec.get("description"):
+        parts.append(f"Clinical meaning: {spec['description']}.")
+    if spec.get("unit"):
+        parts.append(f"Unit: {spec['unit']}.")
+    if spec.get("normal_range"):
+        parts.append(f"Normal range: {spec['normal_range']}.")
+    window_name = spec.get("window_name") or "full encounter"
+    statistic = spec.get("statistic") or "latest"
+    parts.append(f"Target: {statistic} value during {window_name}.")
+    return " ".join(parts)
+
+
+def make_query_spec(raw_spec: Dict[str, Any]) -> PhenotypeQuerySpec:
+    spec = dict(raw_spec)
+    item = str(spec.get("item") or spec.get("name") or "").strip()
+    if not item:
+        raise ValueError(f"Phenotype query spec is missing an item/name: {raw_spec}")
+    aliases = [str(value).strip() for value in spec.get("aliases", []) if str(value).strip()]
+    statistic = str(spec.get("statistic", "latest")).strip().lower()
+    window_name = str(spec.get("window_name", "full encounter")).strip() or "full encounter"
+    key = str(spec.get("key") or "").strip()
+    if not key:
+        key = sanitize_key(f"{item}_{spec.get('unit', '')}_{window_name}_{statistic}")
+    spec.setdefault("query_text", build_query_text({**spec, "item": item, "statistic": statistic}))
+    return PhenotypeQuerySpec(
+        key=key,
+        item=item,
+        query_text=str(spec["query_text"]),
+        aliases=aliases,
+        statistic=statistic,
+        unit=str(spec.get("unit", "")),
+        description=str(spec.get("description", "")),
+        normal_range=str(spec.get("normal_range", "")),
+        window_name=window_name,
+        window_start_hours=spec.get("window_start_hours"),
+        window_end_hours=spec.get("window_end_hours"),
+        category_regex=str(spec.get("category_regex", "^measurement$")),
+        item_regex=spec.get("item_regex"),
+        transform=str(spec.get("transform", "none")).lower(),
+        mean=spec.get("mean"),
+        scale=spec.get("scale"),
+    )
+
+
+def load_query_specs(path: str) -> List[PhenotypeQuerySpec]:
+    with open(path, "r", encoding="utf-8") as f:
+        if path.endswith(".jsonl"):
+            raw_specs = [json.loads(line) for line in f if line.strip()]
+        else:
+            data = json.load(f)
+            if isinstance(data, dict):
+                raw_specs = []
+                for key, value in data.items():
+                    spec = dict(value)
+                    spec.setdefault("key", key)
+                    raw_specs.append(spec)
+            else:
+                raw_specs = list(data)
+    specs = [make_query_spec(spec) for spec in raw_specs]
+    if not specs:
+        raise ValueError(f"No phenotype query specs loaded from {path}")
+    return specs
+
+
+def category_is_continuous(category: Any, pattern: str) -> bool:
+    return re.search(pattern, str(category), flags=re.IGNORECASE) is not None
+
+
+def apply_value_transform(values: pd.Series, transform: str) -> pd.Series:
+    if transform == "none":
+        return values
+    if transform == "log1p":
+        return values.where(values >= 0).map(lambda value: math.log1p(value) if pd.notna(value) else value)
+    if transform == "log":
+        return values.where(values > 0).map(lambda value: math.log(value) if pd.notna(value) else value)
+    raise ValueError(f"Unsupported value transform: {transform}")
+
+
+def aggregate_phenotype_value(
+    selected: pd.DataFrame,
+    spec: PhenotypeQuerySpec,
+    anchor_time: Optional[pd.Timestamp],
+) -> Optional[float]:
+    selected = selected.copy()
+    selected_values = apply_value_transform(
+        pd.to_numeric(selected["Value"], errors="coerce"),
+        spec.transform,
+    )
+    selected = selected.loc[selected_values.notna()].copy()
+    selected["numeric_value"] = selected_values.loc[selected_values.notna()].astype(float)
+    if selected.empty:
+        return None
+
+    if anchor_time is not None and selected["Time"].notna().any():
+        selected["hours_from_anchor"] = (selected["Time"] - anchor_time).dt.total_seconds() / 3600.0
+        if spec.window_start_hours is not None:
+            selected = selected[selected["hours_from_anchor"] >= float(spec.window_start_hours)]
+        if spec.window_end_hours is not None:
+            selected = selected[selected["hours_from_anchor"] <= float(spec.window_end_hours)]
+    if selected.empty:
+        return None
+
+    selected = selected.sort_values("Time").reset_index(drop=True)
+    values = selected["numeric_value"].astype(float)
+    statistic = spec.statistic
+
+    if statistic in {"latest", "last"}:
+        return float(values.iloc[-1])
+    if statistic == "first":
+        return float(values.iloc[0])
+    if statistic == "mean":
+        return float(values.mean())
+    if statistic == "median":
+        return float(values.median())
+    if statistic == "max":
+        return float(values.max())
+    if statistic == "min":
+        return float(values.min())
+    if statistic == "std":
+        return float(values.std(ddof=0)) if len(values) > 1 else 0.0
+    if statistic == "count":
+        return float(len(values))
+    if statistic == "slope":
+        if len(values) < 2 or "hours_from_anchor" not in selected:
+            return None
+        hours = selected["hours_from_anchor"].astype(float)
+        valid = hours.notna()
+        if valid.sum() < 2 or hours[valid].nunique() < 2:
+            return None
+        x = torch.tensor(hours[valid].to_numpy(), dtype=torch.float64)
+        y = torch.tensor(values[valid].to_numpy(), dtype=torch.float64)
+        x_centered = x - x.mean()
+        denom = (x_centered * x_centered).sum()
+        if denom <= 0:
+            return None
+        return float((x_centered * (y - y.mean())).sum() / denom)
+
+    raise ValueError(f"Unsupported phenotype statistic: {statistic}")
+
+
+def extract_phenotype_value(table: pd.DataFrame, spec: PhenotypeQuerySpec) -> Optional[float]:
+    if table is None or table.empty:
+        return None
+
+    item_text = table["Item"].fillna("").astype(str)
+    aliases = [spec.item, *spec.aliases]
+    alias_set = {alias.lower() for alias in aliases if alias}
+    if spec.item_regex:
+        item_mask = item_text.str.contains(spec.item_regex, case=False, regex=True, na=False)
+    else:
+        item_mask = item_text.str.lower().isin(alias_set)
+
+    category_mask = table["Category"].map(lambda value: category_is_continuous(value, spec.category_regex))
+    numeric_values = pd.to_numeric(table["Value"], errors="coerce")
+    mask = item_mask & category_mask & numeric_values.notna()
+    if spec.unit:
+        unit_text = table["Unit"].fillna("").astype(str).str.strip().str.lower()
+        mask = mask & (unit_text == spec.unit.strip().lower())
+    if not mask.any():
+        return None
+
+    anchor_time = table["Time"].dropna().iloc[0] if table["Time"].notna().any() else None
+    return aggregate_phenotype_value(table.loc[mask], spec, anchor_time)
+
+
+class PhenotypeValueExtractor:
+    def __init__(self, query_specs: List[PhenotypeQuerySpec]):
+        self.query_specs = query_specs
+        self.exact_groups: Dict[tuple, List[tuple]] = {}
+        self.fallback_indices = []
+
+        for spec_idx, spec in enumerate(query_specs):
+            if spec.item_regex or spec.category_regex != "^measurement$":
+                self.fallback_indices.append(spec_idx)
+                continue
+            aliases = tuple(sorted({spec.item.lower(), *(alias.lower() for alias in spec.aliases)}))
+            group_key = (aliases, spec.unit.strip().lower(), spec.transform)
+            self.exact_groups.setdefault(group_key, []).append((spec_idx, spec))
+
+    def __call__(self, table: pd.DataFrame):
+        values = [0.0] * len(self.query_specs)
+        masks = [False] * len(self.query_specs)
+        if table is None or table.empty:
+            return values, masks
+
+        numeric_values = pd.to_numeric(table["Value"], errors="coerce")
+        category = table["Category"].fillna("").astype(str).str.strip().str.lower()
+        numeric_rows = table.loc[(category == "measurement") & numeric_values.notna()].copy()
+        numeric_rows["_item_key"] = numeric_rows["Item"].fillna("").astype(str).str.strip().str.lower()
+        numeric_rows["_unit_key"] = numeric_rows["Unit"].fillna("").astype(str).str.strip().str.lower()
+        by_item_unit = {
+            key: group.drop(columns=["_item_key", "_unit_key"])
+            for key, group in numeric_rows.groupby(["_item_key", "_unit_key"], sort=False)
+        }
+        by_item = {
+            key: group.drop(columns=["_item_key", "_unit_key"])
+            for key, group in numeric_rows.groupby("_item_key", sort=False)
+        }
+        anchor_time = table["Time"].dropna().iloc[0] if table["Time"].notna().any() else None
+
+        for (aliases, unit, _), indexed_specs in self.exact_groups.items():
+            groups = []
+            for alias in aliases:
+                selected = by_item_unit.get((alias, unit)) if unit else by_item.get(alias)
+                if selected is not None:
+                    groups.append(selected)
+            if not groups:
+                continue
+            selected = groups[0] if len(groups) == 1 else pd.concat(groups, ignore_index=True)
+            for spec_idx, spec in indexed_specs:
+                value = aggregate_phenotype_value(selected, spec, anchor_time)
+                if value is not None and math.isfinite(float(value)):
+                    values[spec_idx] = float(value)
+                    masks[spec_idx] = True
+
+        for spec_idx in self.fallback_indices:
+            value = extract_phenotype_value(table, self.query_specs[spec_idx])
+            if value is not None and math.isfinite(float(value)):
+                values[spec_idx] = float(value)
+                masks[spec_idx] = True
+
+        return values, masks
+
+
 def build_task_dataset(args: CacheBuildArguments, split: str):
-    task_info = tqc.get_task_info()
-    binary_tasks = tqc.binary_task_names(task_info)
+    task_info = get_task_info()
+    binary_tasks = binary_task_names(task_info)
     multiclass_tasks = sorted(
         task_name
         for task_name, info in task_info.items()
@@ -170,9 +634,9 @@ def build_task_dataset(args: CacheBuildArguments, split: str):
             else args.task_val_sample_info_path
         )
         parts.extend(
-            tqc.build_mimic_datasets(
+            build_mimic_datasets(
                 args.root_dir,
-                tqc.resolve_sample_info_paths(path),
+                resolve_sample_info_paths(path),
             )
         )
     if "eicu" in args.dataset:
@@ -184,13 +648,13 @@ def build_task_dataset(args: CacheBuildArguments, split: str):
         tasks = [
             name
             for name in supervised_tasks
-            if name in tqc.get_eicu_task_info()
+            if name in get_eicu_task_info()
         ]
         parts.extend(
-            tqc.build_eicu_datasets(
+            build_eicu_datasets(
                 args.eicu_root_dir,
                 args.eicu_processed_dir,
-                tqc.load_json_records(path),
+                json.load(open(path, "r", encoding="utf-8")),
                 tasks,
             )
         )
@@ -203,16 +667,16 @@ def build_task_dataset(args: CacheBuildArguments, split: str):
         tasks = [
             name
             for name in supervised_tasks
-            if name in tqc.get_ehrshot_task_info()
+            if name in get_ehrshot_task_info()
         ]
         parts.extend(
-            tqc.build_ehrshot_datasets(
+            build_ehrshot_datasets(
                 args.ehrshot_root_dir,
-                tqc.load_csv_records(path),
+                pd.read_csv(path, low_memory=False).to_dict(orient="records"),
                 tasks,
             )
         )
-    return tqc.TaskQueryDataset(parts, max_samples=None)
+    return TaskQueryDataset(parts, max_samples=None)
 
 
 def tte_index_paths(args: CacheBuildArguments, dataset_name: str, split: str):
@@ -225,16 +689,16 @@ def build_tte_dataset(args: CacheBuildArguments, split: str):
     if "mimic_iv" in args.dataset:
         paths = tte_index_paths(args, "mimic_iv", split)
         if paths:
-            parts.extend(tqc.build_mimic_datasets(args.root_dir, paths))
+            parts.extend(build_mimic_datasets(args.root_dir, paths))
     if "eicu" in args.dataset:
         paths = tte_index_paths(args, "eicu", split)
         records = []
         for path in paths:
-            records.extend(tqc.load_csv_records(path))
+            records.extend(pd.read_csv(path, low_memory=False).to_dict(orient="records"))
         if records:
             task_names = sorted({str(row["task_name"]) for row in records})
             parts.extend(
-                tqc.build_eicu_datasets(
+                build_eicu_datasets(
                     args.eicu_root_dir,
                     args.eicu_processed_dir,
                     records,
@@ -245,11 +709,11 @@ def build_tte_dataset(args: CacheBuildArguments, split: str):
         paths = tte_index_paths(args, "ehrshot", split)
         records = []
         for path in paths:
-            records.extend(tqc.load_csv_records(path))
+            records.extend(pd.read_csv(path, low_memory=False).to_dict(orient="records"))
         if records:
             task_names = sorted({str(row["task_name"]) for row in records})
             parts.extend(
-                tqc.build_ehrshot_datasets(
+                build_ehrshot_datasets(
                     args.ehrshot_root_dir,
                     records,
                     task_names,
@@ -278,7 +742,7 @@ def build_pretraining_context_dataset(args: CacheBuildArguments, split: str):
             split,
         )
         if _existing_path(path):
-            parts.extend(tqc.build_mimic_datasets(args.root_dir, [path]))
+            parts.extend(build_mimic_datasets(args.root_dir, [path]))
         else:
             print(f"{split}: skip missing MIMIC-IV pretraining context index: {path}")
 
@@ -292,10 +756,10 @@ def build_pretraining_context_dataset(args: CacheBuildArguments, split: str):
             parts.append(
                 (
                     "eicu",
-                    tqc.EICUDataset(
+                    EICUDataset(
                         root_dir=args.eicu_root_dir,
                         processed_dir=args.eicu_processed_dir,
-                        sample_info=tqc.load_json_records(path),
+                        sample_info=json.load(open(path, "r", encoding="utf-8")),
                         task_name=None,
                         lazy_mode=True,
                         shuffle=False,
@@ -315,9 +779,9 @@ def build_pretraining_context_dataset(args: CacheBuildArguments, split: str):
             parts.append(
                 (
                     "ehrshot",
-                    tqc.EHRSHOTDataset(
+                    EHRSHOTDataset(
                         root_dir=args.ehrshot_root_dir,
-                        sample_info=tqc.load_csv_records(path),
+                        sample_info=pd.read_csv(path, low_memory=False).to_dict(orient="records"),
                         task_name=None,
                         lazy_mode=True,
                     ),
@@ -344,7 +808,7 @@ def build_piecewise_survival_target(
     time_to_event: float,
     event_observed: bool,
     horizon_days: float,
-    max_bins: int = MAX_TTE_BINS,
+    max_bins: int = 365,
 ):
     observed_time = max(float(time_to_event), 0.0)
     num_bins = max(1, min(int(np.ceil(float(horizon_days))), max_bins))
@@ -405,7 +869,7 @@ class TteTaskQueryDataset(torch.utils.data.Dataset):
             "table": sample["measurement_table"],
             "task": task_name,
             "content_task": str(sample_info.get("source_binary_task", task_name)),
-            "task_type_id": TASK_TYPE_TTE,
+            "task_type_id": 1,
             "label": 0.0,
             "survival_labels": survival_labels,
             "tte_metadata": metadata,
@@ -445,19 +909,19 @@ class PretrainingContextDataset(torch.utils.data.Dataset):
         sample = dataset[sample_idx]
         return {
             "table": sample["measurement_table"],
-            "task": PRETRAINING_CONTEXT_TASK,
-            "content_task": PRETRAINING_CONTEXT_TASK,
-            "task_type_id": TASK_TYPE_BINARY,
+            "task": "__pretraining_context__",
+            "content_task": "__pretraining_context__",
+            "task_type_id": 0,
             "label": 0.0,
             "task_loss_mask": 0.0,
-            "survival_labels": np.zeros((3, MAX_TTE_BINS), dtype=np.float32),
+            "survival_labels": np.zeros((3, 365), dtype=np.float32),
         }
 
     def task_names(self):
-        return [PRETRAINING_CONTEXT_TASK]
+        return ["__pretraining_context__"]
 
     def content_task_names(self):
-        return [PRETRAINING_CONTEXT_TASK]
+        return ["__pretraining_context__"]
 
 
 class MixedTaskDataset(torch.utils.data.Dataset):
@@ -474,10 +938,10 @@ class MixedTaskDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         dataset_idx, sample_idx = self.index[idx]
         sample = self.datasets[dataset_idx][sample_idx]
-        sample.setdefault("task_type_id", TASK_TYPE_BINARY)
+        sample.setdefault("task_type_id", 0)
         sample.setdefault("content_task", sample["task"])
         if "survival_labels" not in sample:
-            sample["survival_labels"] = np.zeros((3, MAX_TTE_BINS), dtype=np.float32)
+            sample["survival_labels"] = np.zeros((3, 365), dtype=np.float32)
         return sample
 
     def task_names(self):
@@ -494,6 +958,95 @@ class MixedTaskDataset(torch.utils.data.Dataset):
             else:
                 tasks.update(dataset.task_names())
         return sorted(tasks)
+
+
+def nested_dataset_layout(mixed_dataset):
+    layout = []
+    for outer_idx, outer_dataset in enumerate(mixed_dataset.datasets):
+        outer_entry = {
+            "outer_idx": outer_idx,
+            "class": outer_dataset.__class__.__name__,
+            "length": len(outer_dataset),
+            "sources": [],
+        }
+        for inner_idx, (dataset_name, dataset) in enumerate(getattr(outer_dataset, "datasets", [])):
+            outer_entry["sources"].append(
+                {
+                    "inner_idx": inner_idx,
+                    "dataset_name": str(dataset_name),
+                    "class": dataset.__class__.__name__,
+                    "length": len(dataset),
+                }
+            )
+        layout.append(outer_entry)
+    return layout
+
+
+def source_specs_from_registry(mixed_dataset, source_registry):
+    specs = []
+    for source_id, (dataset_name, source_dataset) in enumerate(source_registry):
+        source_object_id = id(source_dataset)
+        match = None
+        for outer_idx, outer_dataset in enumerate(mixed_dataset.datasets):
+            for inner_idx, (candidate_name, candidate_dataset) in enumerate(
+                getattr(outer_dataset, "datasets", [])
+            ):
+                if id(candidate_dataset) == source_object_id:
+                    match = {
+                        "source_id": source_id,
+                        "outer_idx": outer_idx,
+                        "inner_idx": inner_idx,
+                        "dataset_name": str(candidate_name),
+                        "length": len(candidate_dataset),
+                    }
+                    break
+            if match is not None:
+                break
+        if match is None:
+            raise ValueError(f"Could not locate source dataset for {dataset_name}.")
+        specs.append(match)
+    return specs
+
+
+def source_registry_from_specs(mixed_dataset, source_specs):
+    source_registry = []
+    for spec in sorted(source_specs, key=lambda item: int(item["source_id"])):
+        outer_dataset = mixed_dataset.datasets[int(spec["outer_idx"])]
+        dataset_name, dataset = outer_dataset.datasets[int(spec["inner_idx"])]
+        if str(dataset_name) != str(spec["dataset_name"]) or len(dataset) != int(spec["length"]):
+            raise ValueError("Unified supervision source cache does not match current datasets.")
+        source_registry.append((str(dataset_name), dataset))
+    return source_registry
+
+
+def write_unified_records_cache(
+    run_id,
+    dataset_layout,
+    mixed_sample_count,
+    source_registry,
+    input_records,
+    supervision_count,
+    input_records_path,
+    records_meta_path,
+    mixed_dataset,
+):
+    input_records_tmp = f"{input_records_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    with open(input_records_tmp, "w", encoding="utf-8") as f:
+        json.dump(input_records, f, separators=(",", ":"))
+    os.replace(input_records_tmp, input_records_path)
+    metadata = {
+        "cache_version": 1,
+        "run_id": run_id,
+        "mixed_sample_count": mixed_sample_count,
+        "supervision_count": supervision_count,
+        "input_count": len(input_records),
+        "dataset_layout": dataset_layout,
+        "source_specs": source_specs_from_registry(mixed_dataset, source_registry),
+    }
+    metadata_tmp = f"{records_meta_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    with open(metadata_tmp, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    os.replace(metadata_tmp, records_meta_path)
 
 
 def json_key(values: List[Any]) -> str:
@@ -592,17 +1145,17 @@ def binary_supervision_record(task_dataset, idx, source_registry, source_to_id):
     sample_info = dataset.sample_info[sample_idx]
     if dataset_name == "mimic_iv":
         task_name = str(sample_info["task"])
-        label = tqc.parse_binary_label(sample_info["target"])
-        task_type_id = TASK_TYPE_BINARY
+        label = parse_binary_label(sample_info["target"])
+        task_type_id = 0
     else:
         task_name = str(sample_info["task_name"])
-        task_type = tqc.get_task_info()[task_name]["task_type"]
+        task_type = get_task_info()[task_name]["task_type"]
         if task_type == "multi_class_classification":
             label = int(float(sample_info["label"]))
-            task_type_id = TASK_TYPE_MULTICLASS
+            task_type_id = 2
         else:
-            label = tqc.parse_binary_label(sample_info["label"])
-            task_type_id = TASK_TYPE_BINARY
+            label = parse_binary_label(sample_info["label"])
+            task_type_id = 0
     source_id = register_source(source_registry, source_to_id, dataset_name, dataset)
     return {
         "source_id": source_id,
@@ -645,7 +1198,7 @@ def tte_supervision_record(tte_dataset, idx, source_registry, source_to_id):
         "input_key": table_input_key(dataset_name, dataset, sample_info, task_name),
         "task": task_name,
         "content_task": str(sample_info.get("source_binary_task", task_name)),
-        "task_type_id": TASK_TYPE_TTE,
+        "task_type_id": 1,
         "label": 0.0,
         "time_to_event": time_to_event,
         "event_observed": event_observed,
@@ -664,9 +1217,9 @@ def pretraining_context_supervision_record(context_dataset, idx, source_registry
         "source_id": source_id,
         "sample_idx": int(sample_idx),
         "input_key": pretraining_context_input_key(dataset_name, sample_info),
-        "task": PRETRAINING_CONTEXT_TASK,
-        "content_task": PRETRAINING_CONTEXT_TASK,
-        "task_type_id": TASK_TYPE_BINARY,
+        "task": "__pretraining_context__",
+        "content_task": "__pretraining_context__",
+        "task_type_id": 0,
         "label": 0.0,
         "task_loss_mask": 0.0,
         "survival_target": None,
@@ -674,7 +1227,7 @@ def pretraining_context_supervision_record(context_dataset, idx, source_registry
     }
 
 
-def build_unified_records(mixed_dataset, split_dir: str, run_id: str):
+def build_unified_records(mixed_dataset, split_dir: str, run_id: str, resume: bool = True):
     source_registry = []
     source_to_id = {}
     input_records = []
@@ -682,6 +1235,32 @@ def build_unified_records(mixed_dataset, split_dir: str, run_id: str):
     run_dir = os.path.join(split_dir, "runs", run_id)
     os.makedirs(run_dir, exist_ok=True)
     supervision_records_path = os.path.join(run_dir, "supervision_records.jsonl")
+    input_records_path = os.path.join(run_dir, "input_records.json")
+    records_meta_path = os.path.join(run_dir, "unified_records_meta.json")
+    dataset_layout = nested_dataset_layout(mixed_dataset)
+
+    if resume and os.path.exists(supervision_records_path) and os.path.exists(input_records_path) and os.path.exists(records_meta_path):
+        with open(records_meta_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        if (
+            int(metadata["cache_version"]) == 1
+            and str(metadata["run_id"]) == str(run_id)
+            and int(metadata["mixed_sample_count"]) == len(mixed_dataset.index)
+            and metadata["dataset_layout"] == dataset_layout
+        ):
+            with open(input_records_path, "r", encoding="utf-8") as f:
+                input_records = json.load(f)
+            source_registry = source_registry_from_specs(
+                mixed_dataset,
+                metadata["source_specs"],
+            )
+            supervision_count = int(metadata["supervision_count"])
+            print(
+                f"Loaded unified supervision cache: "
+                f"{supervision_count} samples share {len(input_records)} unique inputs"
+            )
+            return source_registry, input_records, supervision_records_path, supervision_count
+
     temporary_path = f"{supervision_records_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     supervision_count = 0
 
@@ -723,6 +1302,17 @@ def build_unified_records(mixed_dataset, split_dir: str, run_id: str):
             )
             supervision_count += 1
     os.replace(temporary_path, supervision_records_path)
+    write_unified_records_cache(
+        run_id=run_id,
+        dataset_layout=dataset_layout,
+        mixed_sample_count=len(mixed_dataset.index),
+        source_registry=source_registry,
+        input_records=input_records,
+        supervision_count=supervision_count,
+        input_records_path=input_records_path,
+        records_meta_path=records_meta_path,
+        mixed_dataset=mixed_dataset,
+    )
     return source_registry, input_records, supervision_records_path, supervision_count
 
 
@@ -736,15 +1326,12 @@ def tensorize_table(table, text_to_idx, type_vocab):
     seq_len = int(tensors["seq_mask"][0].sum().item())
     return {
         field_name: tensors[field_name][0, :seq_len].cpu().numpy()
-        for field_name in pml.PREPROCESSED_SEQUENCE_DTYPES
+        for field_name in sequence_dtypes
     }
 
 
 def _coerce_datetime_series(values):
-    try:
-        return pd.to_datetime(values, errors="coerce", format="mixed")
-    except (TypeError, ValueError):
-        return pd.to_datetime(values, errors="coerce")
+    return pd.to_datetime(values, errors="coerce", format="mixed")
 
 
 def normalize_measurement_table(table):
@@ -765,45 +1352,6 @@ def normalize_measurement_table(table):
         table["Value"] = ""
 
     return table
-
-
-def process_sample(
-    dataset,
-    idx,
-    task_to_id,
-    content_task_to_id,
-    extractor,
-    text_to_idx,
-    type_vocab,
-    min_table_rows,
-):
-    sample = dataset[idx]
-    table = normalize_measurement_table(sample["table"])
-    if table is None or table.empty:
-        return {"status": "empty"}
-    if len(table) < min_table_rows:
-        return {"status": "short"}
-
-    values, masks = extractor(table)
-    sequences = tensorize_table(table, text_to_idx, type_vocab)
-    if len(sequences["item_ids"]) < min_table_rows:
-        return {"status": "short"}
-
-    return {
-        "status": "ok",
-        "sequences": sequences,
-        "task_id": task_to_id[str(sample["task"])],
-        "content_task_id": content_task_to_id[str(sample.get("content_task", sample["task"]))],
-        "task_type_id": int(sample.get("task_type_id", TASK_TYPE_BINARY)),
-        "label": float(sample["label"]),
-        "survival_labels": np.asarray(
-            sample.get("survival_labels", np.zeros((3, MAX_TTE_BINS), dtype=np.float32)),
-            dtype=np.float32,
-        ),
-        "tte_metadata": sample.get("tte_metadata"),
-        "phenotype_values": values,
-        "phenotype_mask": masks,
-    }
 
 
 def process_input_record(
@@ -837,55 +1385,6 @@ def process_input_record(
     }
 
 
-def init_worker(
-    dataset,
-    task_to_id,
-    content_task_to_id,
-    task_num_classes,
-    query_specs,
-    text_to_idx,
-    type_vocab,
-    min_table_rows,
-    torch_threads,
-    split_dir=None,
-    run_id=None,
-    progress_queue=None,
-    progress_update_interval=128,
-):
-    global _WORKER_DATASET
-    global _WORKER_SOURCE_REGISTRY
-    global _WORKER_INPUT_RECORDS
-    global _WORKER_TASK_TO_ID
-    global _WORKER_CONTENT_TASK_TO_ID
-    global _WORKER_EXTRACTOR
-    global _WORKER_TEXT_TO_IDX
-    global _WORKER_TYPE_VOCAB
-    global _WORKER_MIN_TABLE_ROWS
-    global _WORKER_TORCH_THREADS
-    global _WORKER_SPLIT_DIR
-    global _WORKER_RUN_ID
-    global _WORKER_NUM_PHENOTYPES
-    global _WORKER_PROGRESS_QUEUE
-    global _WORKER_PROGRESS_UPDATE_INTERVAL
-
-    _WORKER_DATASET = dataset
-    _WORKER_SOURCE_REGISTRY = None
-    _WORKER_INPUT_RECORDS = None
-    _WORKER_TASK_TO_ID = task_to_id
-    _WORKER_CONTENT_TASK_TO_ID = content_task_to_id
-    _WORKER_EXTRACTOR = pml.PhenotypeValueExtractor(query_specs)
-    _WORKER_TEXT_TO_IDX = text_to_idx
-    _WORKER_TYPE_VOCAB = type_vocab
-    _WORKER_MIN_TABLE_ROWS = int(min_table_rows)
-    _WORKER_TORCH_THREADS = max(1, int(torch_threads))
-    _WORKER_SPLIT_DIR = split_dir
-    _WORKER_RUN_ID = run_id
-    _WORKER_NUM_PHENOTYPES = len(query_specs)
-    _WORKER_PROGRESS_QUEUE = progress_queue
-    _WORKER_PROGRESS_UPDATE_INTERVAL = max(1, int(progress_update_interval))
-    torch.set_num_threads(_WORKER_TORCH_THREADS)
-
-
 def init_input_worker(
     source_registry,
     input_records,
@@ -899,99 +1398,40 @@ def init_input_worker(
     progress_queue=None,
     progress_update_interval=128,
 ):
-    global _WORKER_SOURCE_REGISTRY
-    global _WORKER_INPUT_RECORDS
-    global _WORKER_EXTRACTOR
-    global _WORKER_TEXT_TO_IDX
-    global _WORKER_TYPE_VOCAB
-    global _WORKER_MIN_TABLE_ROWS
-    global _WORKER_TORCH_THREADS
-    global _WORKER_SPLIT_DIR
-    global _WORKER_RUN_ID
-    global _WORKER_NUM_PHENOTYPES
-    global _WORKER_PROGRESS_QUEUE
-    global _WORKER_PROGRESS_UPDATE_INTERVAL
-
-    _WORKER_SOURCE_REGISTRY = source_registry
-    _WORKER_INPUT_RECORDS = input_records
-    _WORKER_EXTRACTOR = pml.PhenotypeValueExtractor(query_specs)
-    _WORKER_TEXT_TO_IDX = text_to_idx
-    _WORKER_TYPE_VOCAB = type_vocab
-    _WORKER_MIN_TABLE_ROWS = int(min_table_rows)
-    _WORKER_TORCH_THREADS = max(1, int(torch_threads))
-    _WORKER_SPLIT_DIR = split_dir
-    _WORKER_RUN_ID = run_id
-    _WORKER_NUM_PHENOTYPES = len(query_specs)
-    _WORKER_PROGRESS_QUEUE = progress_queue
-    _WORKER_PROGRESS_UPDATE_INTERVAL = max(1, int(progress_update_interval))
-    torch.set_num_threads(_WORKER_TORCH_THREADS)
-
-
-def process_sample_worker(idx):
-    return process_sample(
-        _WORKER_DATASET,
-        idx,
-        _WORKER_TASK_TO_ID,
-        _WORKER_CONTENT_TASK_TO_ID,
-        _WORKER_EXTRACTOR,
-        _WORKER_TEXT_TO_IDX,
-        _WORKER_TYPE_VOCAB,
-        _WORKER_MIN_TABLE_ROWS,
+    worker_state.clear()
+    worker_state.update(
+        source_registry=source_registry,
+        input_records=input_records,
+        extractor=PhenotypeValueExtractor(query_specs),
+        text_to_idx=text_to_idx,
+        type_vocab=type_vocab,
+        min_table_rows=int(min_table_rows),
+        split_dir=split_dir,
+        run_id=run_id,
+        num_phenotypes=len(query_specs),
+        progress_queue=progress_queue,
+        progress_update_interval=max(1, int(progress_update_interval)),
     )
+    torch.set_num_threads(max(1, int(torch_threads)))
 
 
 def process_input_worker(idx):
     return process_input_record(
-        _WORKER_SOURCE_REGISTRY,
-        _WORKER_INPUT_RECORDS,
+        worker_state["source_registry"],
+        worker_state["input_records"],
         idx,
-        _WORKER_EXTRACTOR,
-        _WORKER_TEXT_TO_IDX,
-        _WORKER_TYPE_VOCAB,
-        _WORKER_MIN_TABLE_ROWS,
+        worker_state["extractor"],
+        worker_state["text_to_idx"],
+        worker_state["type_vocab"],
+        worker_state["min_table_rows"],
     )
 
 
-def describe_worker_input(idx: int) -> str:
-    try:
-        record = _WORKER_INPUT_RECORDS[idx]
-        dataset_name, dataset = _WORKER_SOURCE_REGISTRY[int(record["source_id"])]
-        sample_idx = int(record["sample_idx"])
-        sample_info = dataset.sample_info[sample_idx]
-        compact_info = {
-            key: sample_info.get(key)
-            for key in (
-                "patient_id",
-                "subject_id",
-                "icustay_id",
-                "task",
-                "task_name",
-                "source_binary_task",
-                "period_begin",
-                "period_end",
-                "prediction_time",
-                "context_begin",
-                "context_end",
-                "obs_hours",
-            )
-            if key in sample_info
-        }
-        return (
-            f"input_idx={idx}, dataset={dataset_name}, "
-            f"source_id={record['source_id']}, sample_idx={sample_idx}, "
-            f"sample_info={compact_info}"
-        )
-    except Exception as context_error:
-        return f"input_idx={idx}, failed_to_describe={context_error!r}"
-
-
 def report_worker_progress(count):
-    if _WORKER_PROGRESS_QUEUE is None:
+    progress_queue = worker_state.get("progress_queue")
+    if progress_queue is None:
         return
-    try:
-        _WORKER_PROGRESS_QUEUE.put(count)
-    except (BrokenPipeError, EOFError, OSError):
-        pass
+    progress_queue.put(count)
 
 
 def part_relative_path(run_id: str, part_idx: int) -> str:
@@ -1018,70 +1458,62 @@ def existing_part_metadata(
     meta_path = part_metadata_path(part_dir)
     metadata = None
     if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                metadata = json.load(f)
-            if int(metadata.get("source_record_count", -1)) != record_end - record_start:
-                return None
-        except (OSError, ValueError, json.JSONDecodeError):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        if int(metadata.get("source_record_count", -1)) != record_end - record_start:
             return None
     elif not os.path.isdir(part_dir):
         return None
-    try:
-        offsets_path = os.path.join(part_dir, "offsets.npy")
-        if not os.path.exists(offsets_path):
-            return metadata if metadata is not None and metadata.get("part") is None else None
-        offsets = np.load(offsets_path, mmap_mode="r")
-        sample_count = len(offsets) - 1
-        total_rows = int(offsets[-1]) if sample_count >= 0 else 0
-        if metadata is not None and metadata.get("part") is not None:
-            part = metadata.get("part")
-            if part.get("path") != part_rel:
-                return None
-            part_count = int(part.get("input_count", part.get("sample_count", -1)))
-            if part_count != sample_count or int(part["total_rows"]) != total_rows:
-                return None
-        part = {
-            "path": part_rel,
-            "input_count": sample_count,
-            "total_rows": total_rows,
-        }
-        sample_count = int(part["input_count"])
-        total_rows = int(part["total_rows"])
-        if len(offsets) != sample_count + 1 or int(offsets[-1]) != total_rows:
+
+    offsets_path = os.path.join(part_dir, "offsets.npy")
+    if not os.path.exists(offsets_path):
+        return metadata if metadata is not None and metadata.get("part") is None else None
+    offsets = np.load(offsets_path, mmap_mode="r")
+    sample_count = len(offsets) - 1
+    total_rows = int(offsets[-1]) if sample_count >= 0 else 0
+    if metadata is not None and metadata.get("part") is not None:
+        part = metadata.get("part")
+        if part.get("path") != part_rel:
             return None
-        for field_name, dtype in pml.PREPROCESSED_SEQUENCE_DTYPES.items():
-            path = os.path.join(part_dir, f"{field_name}.bin")
-            if os.path.getsize(path) != expected_file_size(total_rows, dtype):
-                return None
-        fixed_files = {
-            "phenotype_values.bin": (sample_count * num_phenotypes, np.float32),
-            "phenotype_mask.bin": (sample_count * num_phenotypes, np.uint8),
-            "input_indices.bin": (sample_count, np.int64),
-        }
-        for filename, (count, dtype) in fixed_files.items():
-            path = os.path.join(part_dir, filename)
-            if os.path.getsize(path) != expected_file_size(count, dtype):
-                return None
-        if metadata is None:
-            metadata = {
-                "part": part,
-                "source_record_count": record_end - record_start,
-                "skipped_empty": 0,
-                "skipped_short": 0,
-            }
-        return metadata
-    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        part_count = int(part.get("input_count", part.get("sample_count", -1)))
+        if part_count != sample_count or int(part["total_rows"]) != total_rows:
+            return None
+    part = {
+        "path": part_rel,
+        "input_count": sample_count,
+        "total_rows": total_rows,
+    }
+    sample_count = int(part["input_count"])
+    total_rows = int(part["total_rows"])
+    if len(offsets) != sample_count + 1 or int(offsets[-1]) != total_rows:
         return None
+    for field_name, dtype in sequence_dtypes.items():
+        path = os.path.join(part_dir, f"{field_name}.bin")
+        if os.path.getsize(path) != expected_file_size(total_rows, dtype):
+            return None
+    fixed_files = {
+        "phenotype_values.bin": (sample_count * num_phenotypes, np.float32),
+        "phenotype_mask.bin": (sample_count * num_phenotypes, np.uint8),
+        "input_indices.bin": (sample_count, np.int64),
+    }
+    for filename, (count, dtype) in fixed_files.items():
+        path = os.path.join(part_dir, filename)
+        if os.path.getsize(path) != expected_file_size(count, dtype):
+            return None
+    if metadata is None:
+        metadata = {
+            "part": part,
+            "source_record_count": record_end - record_start,
+            "skipped_empty": 0,
+            "skipped_short": 0,
+        }
+    return metadata
 
 
 def process_part_worker(payload):
-    if _WORKER_SPLIT_DIR is None or _WORKER_RUN_ID is None:
-        raise RuntimeError("Unified cache worker was not initialized.")
-
     part_idx, record_start, record_end = payload
-    part_rel = part_relative_path(_WORKER_RUN_ID, part_idx)
-    part_dir = os.path.join(_WORKER_SPLIT_DIR, part_rel)
+    part_rel = part_relative_path(worker_state["run_id"], part_idx)
+    part_dir = os.path.join(worker_state["split_dir"], part_rel)
     work_dir = f"{part_dir}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     sequence_files = None
     phenotype_values_file = None
@@ -1096,15 +1528,7 @@ def process_part_worker(payload):
     try:
         for idx in range(record_start, record_end):
             try:
-                try:
-                    result = process_input_worker(idx)
-                except Exception as exc:
-                    context = describe_worker_input(idx)
-                    tb = traceback.format_exc()
-                    raise RuntimeError(
-                        f"Failed while processing part={part_idx} "
-                        f"records={record_start}:{record_end}. {context}\n{tb}"
-                    ) from exc
+                result = process_input_worker(idx)
                 status = result["status"]
                 if status == "empty":
                     skipped_empty += 1
@@ -1121,7 +1545,7 @@ def process_part_worker(payload):
                             os.path.join(work_dir, f"{field_name}.bin"),
                             "wb",
                         )
-                        for field_name in pml.PREPROCESSED_SEQUENCE_DTYPES
+                        for field_name in sequence_dtypes
                     }
                     phenotype_values_file = open(
                         os.path.join(work_dir, "phenotype_values.bin"),
@@ -1138,7 +1562,7 @@ def process_part_worker(payload):
 
                 sequence_length = len(result["sequences"]["item_ids"])
                 np.asarray([idx], dtype=np.int64).tofile(input_indices_file)
-                for field_name, dtype in pml.PREPROCESSED_SEQUENCE_DTYPES.items():
+                for field_name, dtype in sequence_dtypes.items():
                     np.asarray(
                         result["sequences"][field_name],
                         dtype=dtype,
@@ -1146,23 +1570,23 @@ def process_part_worker(payload):
                 np.asarray(
                     result["phenotype_values"],
                     dtype=np.float32,
-                ).reshape(_WORKER_NUM_PHENOTYPES).tofile(phenotype_values_file)
+                ).reshape(worker_state["num_phenotypes"]).tofile(phenotype_values_file)
                 np.asarray(
                     result["phenotype_mask"],
                     dtype=np.uint8,
-                ).reshape(_WORKER_NUM_PHENOTYPES).tofile(phenotype_mask_file)
+                ).reshape(worker_state["num_phenotypes"]).tofile(phenotype_mask_file)
                 offsets.append(offsets[-1] + sequence_length)
                 sample_count += 1
             finally:
                 pending_progress += 1
                 if (
-                    _WORKER_PROGRESS_QUEUE is not None
-                    and pending_progress >= _WORKER_PROGRESS_UPDATE_INTERVAL
+                    worker_state.get("progress_queue") is not None
+                    and pending_progress >= worker_state["progress_update_interval"]
                 ):
                     report_worker_progress(pending_progress)
                     pending_progress = 0
     finally:
-        if _WORKER_PROGRESS_QUEUE is not None and pending_progress:
+        if worker_state.get("progress_queue") is not None and pending_progress:
             report_worker_progress(pending_progress)
         if sequence_files is not None:
             file_handles = list(sequence_files.values()) + [
@@ -1288,7 +1712,7 @@ def write_supervision_index(
     task_loss_masks_file = open(os.path.join(work_dir, "task_loss_masks.bin"), "wb")
     survival_labels_file = open(os.path.join(work_dir, "survival_labels.bin"), "wb")
     write_buffer_size = max(1, int(write_buffer_size))
-    zero_survival_target = np.zeros((3, MAX_TTE_BINS), dtype=np.float32)
+    zero_survival_target = np.zeros((3, 365), dtype=np.float32)
     input_part_ids_buffer = []
     input_local_ids_buffer = []
     task_ids_buffer = []
@@ -1309,7 +1733,7 @@ def write_supervision_index(
         np.asarray(labels_buffer, dtype=np.float32).tofile(labels_file)
         np.asarray(task_loss_masks_buffer, dtype=np.float32).tofile(task_loss_masks_file)
         np.asarray(survival_labels_buffer, dtype=np.float32).reshape(
-            -1, 3, MAX_TTE_BINS
+            -1, 3, 365
         ).tofile(survival_labels_file)
         input_part_ids_buffer.clear()
         input_local_ids_buffer.clear()
@@ -1350,7 +1774,7 @@ def write_supervision_index(
                 task_loss_masks_buffer.append(float(record.get("task_loss_mask", 1.0)))
                 survival_target = record.get("survival_target")
                 if survival_target is None:
-                    if task_type_id == TASK_TYPE_TTE:
+                    if task_type_id == 1:
                         survival_target = build_piecewise_survival_target(
                             time_to_event=float(record["time_to_event"]),
                             event_observed=bool(int(record["event_observed"])),
@@ -1358,8 +1782,8 @@ def write_supervision_index(
                         )
                     else:
                         survival_target = zero_survival_target
-                survival_labels_buffer.append(np.asarray(survival_target, dtype=np.float32).reshape(3, MAX_TTE_BINS))
-                if task_type_id == TASK_TYPE_TTE:
+                survival_labels_buffer.append(np.asarray(survival_target, dtype=np.float32).reshape(3, 365))
+                if task_type_id == 1:
                     metadata = dict(record.get("tte_metadata") or {})
                     metadata["sample_idx"] = sample_count
                     metadata["input_part_id"] = input_part_id
@@ -1424,7 +1848,7 @@ def build_split_cache(
         input_records,
         supervision_records_path,
         supervision_record_count,
-    ) = build_unified_records(dataset, split_dir, run_id)
+    ) = build_unified_records(dataset, split_dir, run_id, resume=args.resume)
     if not input_records:
         raise ValueError(f"No input records found for split={split}.")
     print(
@@ -1541,7 +1965,7 @@ def build_split_cache(
     )
 
     manifest = {
-        "format_version": FORMAT_VERSION,
+        "format_version": 5,
         "split": split,
         "dataset": list(args.dataset),
         "sample_count": int(supervision["sample_count"]),
@@ -1549,11 +1973,11 @@ def build_split_cache(
         "tte_sample_count": int(supervision["tte_sample_count"]),
         "total_rows": sum(int(part["total_rows"]) for part in input_parts),
         "num_phenotypes": len(query_specs),
-        "max_tte_bins": MAX_TTE_BINS,
+        "365": 365,
         "task_type_ids": {
-            "binary": TASK_TYPE_BINARY,
-            "time_to_event": TASK_TYPE_TTE,
-            "multi_class": TASK_TYPE_MULTICLASS,
+            "binary": 0,
+            "time_to_event": 1,
+            "multi_class": 2,
         },
         "task_names": [task for task, _ in sorted(task_to_id.items(), key=lambda item: item[1])],
         "content_task_names": [
@@ -1563,11 +1987,10 @@ def build_split_cache(
             int(task_num_classes.get(task, 1))
             for task, _ in sorted(task_to_id.items(), key=lambda item: item[1])
         ],
-        "phenotype_spec_fingerprint": pml.phenotype_spec_fingerprint(query_specs),
-        "text_vocab_fingerprint": pml.text_vocab_fingerprint(text_to_idx),
+        "phenotype_spec_fingerprint": phenotype_spec_fingerprint(query_specs),
+        "text_vocab_fingerprint": text_vocab_fingerprint(text_to_idx),
         "min_table_rows": args.min_table_rows,
         "num_workers": int(args.num_workers),
-        "worker_chunksize": int(args.worker_chunksize),
         "worker_torch_threads": int(args.worker_torch_threads),
         "worker_max_tasks_per_child": int(args.worker_max_tasks_per_child),
         "skipped_empty": skipped_empty,
@@ -1575,7 +1998,7 @@ def build_split_cache(
         "skipped_supervision_missing_input": int(supervision["skipped_missing_input"]),
         "sequence_dtypes": {
             key: np.dtype(value).name
-            for key, value in pml.PREPROCESSED_SEQUENCE_DTYPES.items()
+            for key, value in sequence_dtypes.items()
         },
         "input_parts": input_parts,
         "supervision": supervision,
@@ -1593,9 +2016,9 @@ def main():
     (args,) = parser.parse_args_into_dataclasses()
     os.environ.setdefault("MIMIC_SKIP_SAMPLE_CACHE_CHECK", "1")
 
-    _, text_to_idx = pml.load_table_text_to_idx(embedding_cache_paths(args))
-    type_vocab = pml.load_type_vocab(args.type_vocab_file)
-    query_specs = pml.load_query_specs(args.phenotype_spec_path)
+    _, text_to_idx = load_table_text_to_idx(embedding_cache_paths(args))
+    type_vocab = load_type_vocab(args.type_vocab_file)
+    query_specs = load_query_specs(args.phenotype_spec_path)
 
     split_task_names = set()
     split_content_task_names = set()
@@ -1611,7 +2034,7 @@ def main():
     content_task_to_id = {
         task_name: idx for idx, task_name in enumerate(content_task_names)
     }
-    task_info = tqc.get_task_info()
+    task_info = get_task_info()
     task_num_classes = {
         task_name: int(task_info.get(task_name, {}).get("num_classes", 1))
         for task_name in task_names

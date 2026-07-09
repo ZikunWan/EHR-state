@@ -71,6 +71,7 @@ class LongTableEncoder1D(_BaseTableEncoder):
                 config.dim_head,
                 config.mlp_dim,
                 config.dropout,
+                kv_heads=config.kv_heads,
             )
             for _ in range(config.depth)
         ])

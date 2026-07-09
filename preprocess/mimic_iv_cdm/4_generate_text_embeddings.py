@@ -6,19 +6,19 @@ Usage:
 
     torchrun --nproc_per_node=4 preprocess/mimic_iv_cdm/4_generate_text_embeddings.py --stage encode \
         --model-path /data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT \
-        --final-output /data/zikun_workspace/.cache/embeddings/mimic_iv_cdm/text_embeddings_clinicalbert.pt
+        --final-output /data/zikun_workspace/input/cache/embeddings/mimic_iv_cdm/text_embeddings_clinicalbert.pt
 
     torchrun --nproc_per_node=4 preprocess/mimic_iv_cdm/4_generate_text_embeddings.py --stage encode \
         --model-path /data/model_weights_public/microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext \
-        --final-output /data/zikun_workspace/.cache/embeddings/mimic_iv_cdm/text_embeddings_pubmedbert.pt
+        --final-output /data/zikun_workspace/input/cache/embeddings/mimic_iv_cdm/text_embeddings_pubmedbert.pt
 
     torchrun --nproc_per_node=4 preprocess/mimic_iv_cdm/4_generate_text_embeddings.py --stage encode \
         --model-path /data/zikun_workspace/checkpoints/pretraining/text_encoder_stage1/epoch_100.pt \
-        --final-output /data/zikun_workspace/.cache/embeddings/mimic_iv_cdm/text_embeddings_stage1.pt
+        --final-output /data/zikun_workspace/input/cache/embeddings/mimic_iv_cdm/text_embeddings_stage1.pt
 
     torchrun --nproc_per_node=4 preprocess/mimic_iv_cdm/4_generate_text_embeddings.py --stage encode \
         --model-path /data/zikun_workspace/checkpoints/pretraining/text_encoder_stage2/epoch_5.pt \
-        --final-output /data/zikun_workspace/.cache/embeddings/mimic_iv_cdm/text_embeddings_stage2.pt
+        --final-output /data/zikun_workspace/input/cache/embeddings/mimic_iv_cdm/text_embeddings_stage2.pt
 """
 import argparse
 import os
@@ -363,7 +363,7 @@ def parse_args():
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/data/zikun_workspace/.cache/embeddings/mimic_iv_cdm",
+        default="/data/zikun_workspace/input/cache/embeddings/mimic_iv_cdm",
         help="Embedding cache dir.",
     )
     parser.add_argument(

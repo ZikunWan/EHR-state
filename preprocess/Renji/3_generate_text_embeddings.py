@@ -6,15 +6,15 @@ Usage:
 
     torchrun --nproc_per_node=4 preprocess/Renji/3_generate_text_embeddings.py --stage encode \
         --model-path /data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT \
-        --final-output /data/zikun_workspace/.cache/embeddings/renji/text_embeddings_clinicalbert.pt
+        --final-output /data/zikun_workspace/input/cache/embeddings/renji/text_embeddings_clinicalbert.pt
 
     torchrun --nproc_per_node=4 preprocess/Renji/3_generate_text_embeddings.py --stage encode \
         --model-path /data/zikun_workspace/checkpoints/pretraining/knowledge_encode/epoch_100.pt \
-        --final-output /data/zikun_workspace/.cache/embeddings/renji/text_embeddings_stage1.pt
+        --final-output /data/zikun_workspace/input/cache/embeddings/renji/text_embeddings_stage1.pt
 
     torchrun --nproc_per_node=4 preprocess/Renji/3_generate_text_embeddings.py --stage encode \
         --model-path /data/zikun_workspace/checkpoints/knowledge_encoder/clinicalBERT_after_stage2/epoch_5.pt \
-        --final-output /data/zikun_workspace/.cache/embeddings/renji/text_embeddings_stage2.pt
+        --final-output /data/zikun_workspace/input/cache/embeddings/renji/text_embeddings_stage2.pt
 """
 import argparse
 import os
@@ -341,7 +341,7 @@ def parse_args():
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/data/zikun_workspace/.cache/embeddings/renji",
+        default="/data/zikun_workspace/input/cache/embeddings/renji",
         help="Embedding cache dir.",
     )
     parser.add_argument(

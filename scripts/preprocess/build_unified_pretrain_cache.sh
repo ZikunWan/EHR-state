@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-MEMORY_LIMIT_GB="${MEMORY_LIMIT_GB:-850}"
+MEMORY_LIMIT_GB="${MEMORY_LIMIT_GB:-900}"
 MEMORY_POLL_SECONDS="${MEMORY_POLL_SECONDS:-1}"
 SUPERVISION_WRITE_BUFFER_SIZE="${SUPERVISION_WRITE_BUFFER_SIZE:-8192}"
 
@@ -78,9 +78,9 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 python ./preprocess/build_unified_pretrain_cache
     --eicu_root_dir "/data/zikun_workspace/eicu-crd" \
     --eicu_processed_dir "/data/zikun_workspace/eicu-crd/processed" \
     --ehrshot_root_dir "/data/zikun_workspace/input/tables/ehrshot" \
-    --table_text_embedding "/data/zikun_workspace/.cache/embeddings/mimic_iv/text_embeddings_stage2.pt" \
-    --eicu_table_text_embedding "/data/zikun_workspace/.cache/embeddings/eicu/text_embeddings_stage2.pt" \
-    --ehrshot_table_text_embedding "/data/zikun_workspace/.cache/embeddings/ehrshot/text_embeddings_stage2.pt" \
+    --table_text_embedding "/data/zikun_workspace/input/cache/embeddings/mimic_iv/text_embeddings.pt" \
+    --eicu_table_text_embedding "/data/zikun_workspace/input/cache/embeddings/eicu/text_embeddings.pt" \
+    --ehrshot_table_text_embedding "/data/zikun_workspace/input/cache/embeddings/ehrshot/text_embeddings.pt" \
     --task_train_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/index/train" \
     --task_val_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/index/val" \
     --eicu_task_train_sample_info_path "/data/zikun_workspace/eicu-crd/processed/sample_info_train.json" \
@@ -95,14 +95,13 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 python ./preprocess/build_unified_pretrain_cache
     --ehrshot_pretraining_val_sample_info_path "/data/zikun_workspace/input/tables/ehrshot/pretraining_index/sample_info_val.csv" \
     --include_pretraining_context true \
     --tte_index_dir "/data/zikun_workspace/input/tasks/time_to_event" \
-    --phenotype_spec_path "/data/zikun_workspace/.cache/phenotype_metric_learning/phenotype_query_specs.json" \
-    --output_dir "/data/zikun_workspace/.cache/unified_pretraining/inputs" \
-    --run_id "unified_pretrain_cache_v5" \
+    --phenotype_spec_path "/data/zikun_workspace/input/cache/pretraining/phenotype_metric_learning/phenotype_query_specs.json" \
+    --output_dir "/data/zikun_workspace/input/cache/pretraining/ehr_encoder/inputs" \
+    --run_id "pretraining_cache_v5_sorted_text_embeddings" \
     --resume true \
     --min_table_rows 2 \
     --part_size 2048 \
     --num_workers 24 \
-    --worker_chunksize 4 \
     --worker_torch_threads 1 \
     --worker_max_tasks_per_child 0 \
     --supervision_write_buffer_size "${SUPERVISION_WRITE_BUFFER_SIZE}" &

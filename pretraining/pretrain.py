@@ -53,41 +53,53 @@ class DataArguments:
     ehrshot_root_dir: str = field(default="/data/zikun_workspace/input/tables/ehrshot")
     table_text_embedding: List[str] = field(
         default_factory=lambda: [
-            "/data/zikun_workspace/.cache/embeddings/mimic_iv/"
-            "text_embeddings_stage2.pt"
+            "/data/zikun_workspace/input/cache/embeddings/mimic_iv/"
+            "text_embeddings.pt"
         ]
     )
     eicu_table_text_embedding: List[str] = field(
         default_factory=lambda: [
-            "/data/zikun_workspace/.cache/embeddings/eicu/"
-            "text_embeddings_stage2.pt"
+            "/data/zikun_workspace/input/cache/embeddings/eicu/"
+            "text_embeddings.pt"
         ]
     )
     ehrshot_table_text_embedding: List[str] = field(
         default_factory=lambda: [
-            "/data/zikun_workspace/.cache/embeddings/ehrshot/"
-            "text_embeddings_stage2.pt"
+            "/data/zikun_workspace/input/cache/embeddings/ehrshot/"
+            "text_embeddings.pt"
         ]
+    )
+    merged_table_embedding_cache: Optional[str] = field(
+        default="/data/zikun_workspace/input/cache/embeddings/merged_table_embeddings.pt"
     )
     type_vocab_file: str = field(
         default="/data/zikun_workspace/code/data/type_vocab.json"
     )
 
     task_query_embedding_cache: str = field(
-        default="/data/zikun_workspace/.cache/embeddings/pretrain/"
+        default="/data/zikun_workspace/input/cache/query_embeddings/pretraining/"
         "task_query_knowledge_embeddings.pt"
     )
 
     phenotype_spec_path: str = field(
-        default="/data/zikun_workspace/.cache/phenotype_metric_learning/"
+        default="/data/zikun_workspace/input/cache/pretraining/phenotype_metric_learning/"
         "phenotype_query_specs.json"
     )
     phenotype_query_embedding_cache: str = field(
-        default="/data/zikun_workspace/.cache/embeddings/pretrain/"
+        default="/data/zikun_workspace/input/cache/query_embeddings/pretraining/"
         "phenotype_query_knowledge_embeddings.pt"
     )
-    unified_preprocessed_input_dir: str = field(
-        default="/data/zikun_workspace/.cache/unified_pretraining/inputs"
+    pretraining_input_dir: str = field(
+        default="/data/zikun_workspace/input/cache/pretraining/ehr_encoder/inputs"
+    )
+    unified_preprocessed_input_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Deprecated alias for --pretraining_input_dir. "
+                "Use input/cache/pretraining/ehr_encoder/inputs."
+            )
+        },
     )
     knowledge_encoder_path: str = field(
         default="/data/zikun_workspace/checkpoints/pretraining/"
@@ -182,19 +194,13 @@ FORMAT_QUERY_KEYS = {
     TASK_TYPE_MULTICLASS: "__format_multi_class_classification__",
 }
 FORMAT_QUERY_TEXTS = {
-    FORMAT_QUERY_KEYS[TASK_TYPE_BINARY]: (
-        "Prediction format: binary classification. Predict whether the target event occurs."
-    ),
-    FORMAT_QUERY_KEYS[TASK_TYPE_TTE]: (
-        "Prediction format: time-to-event survival prediction. Estimate when the target event occurs and account for right censoring."
-    ),
-    FORMAT_QUERY_KEYS[TASK_TYPE_MULTICLASS]: (
-        "Prediction format: multi-class classification. Predict one class among multiple mutually exclusive categories."
-    ),
+    FORMAT_QUERY_KEYS[TASK_TYPE_BINARY]: "This is a classification task.",
+    FORMAT_QUERY_KEYS[TASK_TYPE_TTE]: "This is a time-to-event task.",
+    FORMAT_QUERY_KEYS[TASK_TYPE_MULTICLASS]: "This is a classification task.",
 }
 
 
-class PreprocessedUnifiedTaskDataset(torch.utils.data.Dataset):
+class PreprocessedPretrainingTaskDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         cache_root: str,
@@ -207,7 +213,7 @@ class PreprocessedUnifiedTaskDataset(torch.utils.data.Dataset):
         manifest_path = os.path.join(self.split_dir, "manifest.json")
         if not os.path.exists(manifest_path):
             raise FileNotFoundError(
-                f"Unified pretraining {split} manifest not found: {manifest_path}. "
+                f"EHR encoder pretraining {split} manifest not found: {manifest_path}. "
                 "Run scripts/preprocess/build_unified_pretrain_cache.sh first."
             )
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -215,7 +221,7 @@ class PreprocessedUnifiedTaskDataset(torch.utils.data.Dataset):
 
         self.format_version = int(self.manifest.get("format_version", -1))
         if self.format_version not in SUPPORTED_UNIFIED_PREPROCESSED_FORMATS:
-            raise ValueError(f"Unsupported unified pretraining cache format: {manifest_path}")
+            raise ValueError(f"Unsupported EHR encoder pretraining cache format: {manifest_path}")
         expected_spec_fingerprint = pml.phenotype_spec_fingerprint(phenotype_specs)
         if self.manifest.get("phenotype_spec_fingerprint") != expected_spec_fingerprint:
             raise ValueError(
@@ -236,7 +242,7 @@ class PreprocessedUnifiedTaskDataset(torch.utils.data.Dataset):
         )
         missing_tasks = [
             task_name
-            for task_name in self.content_task_names
+            for task_name in self.task_names
             if task_name not in task_query_embeddings
         ]
         if missing_tasks:
@@ -314,16 +320,16 @@ class PreprocessedUnifiedTaskDataset(torch.utils.data.Dataset):
                 self.part_ends.append(total)
             self.sample_count = total
         if self.sample_count == 0:
-            raise ValueError(f"Unified pretraining {split} cache contains no samples.")
+            raise ValueError(f"EHR encoder pretraining {split} cache contains no samples.")
         if self.format_version >= 4:
             print(
-                f"Loaded unified pretraining {split} cache: "
+                f"Loaded EHR encoder pretraining {split} cache: "
                 f"{self.sample_count} samples over "
                 f"{len(self.input_parts)} shared input parts"
             )
         else:
             print(
-                f"Loaded unified pretraining {split} cache: "
+                f"Loaded EHR encoder pretraining {split} cache: "
                 f"{self.sample_count} samples across {len(self.parts)} parts"
             )
 
@@ -450,15 +456,15 @@ class PreprocessedUnifiedTaskCollator:
     def __init__(
         self,
         task_query_embeddings: Dict[str, torch.Tensor],
-        content_task_names: List[str],
+        task_names: List[str],
         format_query_embeddings: Dict[str, torch.Tensor],
         task_class_query_embeddings: torch.Tensor,
         task_class_query_mask: torch.Tensor,
         max_table_len: Optional[int],
         min_table_rows: int,
     ):
-        self.content_query_embeddings = torch.stack(
-            [task_query_embeddings[task_name].float() for task_name in content_task_names],
+        self.instruction_query_embeddings = torch.stack(
+            [task_query_embeddings[task_name].float() for task_name in task_names],
             dim=0,
         )
         self.format_query_embeddings = torch.stack(
@@ -538,22 +544,39 @@ class PreprocessedUnifiedTaskCollator:
         content_task_id_tensor = torch.tensor(content_task_ids, dtype=torch.long)
         task_id_tensor = torch.tensor(task_ids, dtype=torch.long)
         task_type_id_tensor = torch.tensor(task_type_ids, dtype=torch.long)
-        content_query_embeds = self.content_query_embeddings.index_select(
-            0, content_task_id_tensor
+        instruction_query_embeds = self.instruction_query_embeddings.index_select(
+            0, task_id_tensor
         )
         format_query_embeds = self.format_query_embeddings.index_select(
             0, task_type_id_tensor
         )
-        query_embeds = self.task_class_query_embeddings.index_select(0, task_id_tensor)
-        query_mask = self.task_class_query_mask.index_select(0, task_id_tensor)
-        tte_rows = task_type_id_tensor == TASK_TYPE_TTE
-        if tte_rows.any():
-            query_embeds[tte_rows, 0] = (
-                content_query_embeds[tte_rows] + format_query_embeds[tte_rows]
-            ) / math.sqrt(2.0)
-            query_mask[tte_rows, 0] = 1.0
+        class_query_embeds = self.task_class_query_embeddings.index_select(0, task_id_tensor)
+        class_query_mask = self.task_class_query_mask.index_select(0, task_id_tensor)
+        query_embeds = torch.zeros(
+            batch_size,
+            class_query_embeds.size(1) + 2,
+            instruction_query_embeds.size(-1),
+            dtype=instruction_query_embeds.dtype,
+        )
+        query_mask = torch.zeros(batch_size, class_query_embeds.size(1) + 2, dtype=torch.float)
+        output_query_mask = torch.zeros_like(query_mask)
+
+        query_embeds[:, 0] = instruction_query_embeds
+        query_embeds[:, 1] = format_query_embeds
+        query_mask[:, :2] = 1.0
+        binary_or_tte_rows = (task_type_id_tensor == TASK_TYPE_BINARY) | (
+            task_type_id_tensor == TASK_TYPE_TTE
+        )
+        output_query_mask[binary_or_tte_rows, :2] = 1.0
+
+        multiclass_rows = task_type_id_tensor == TASK_TYPE_MULTICLASS
+        if multiclass_rows.any():
+            query_embeds[multiclass_rows, 2:] = class_query_embeds[multiclass_rows]
+            query_mask[multiclass_rows, 2:] = class_query_mask[multiclass_rows]
+            output_query_mask[multiclass_rows, 2:] = class_query_mask[multiclass_rows]
         table_tensors["query_embeds"] = query_embeds
         table_tensors["query_mask"] = query_mask
+        table_tensors["output_query_mask"] = output_query_mask
         table_tensors["labels"] = torch.tensor(labels, dtype=torch.float)
         table_tensors["task_loss_mask"] = torch.tensor(task_loss_masks, dtype=torch.float)
         table_tensors["task_ids"] = task_id_tensor
@@ -696,6 +719,11 @@ class JointPretrainingModel(PreTrainedModel):
         query_mask = inputs.get("query_mask")
         if query_mask is not None:
             query_mask = query_mask.to(pooled.device)
+        output_query_mask = inputs.get("output_query_mask")
+        if output_query_mask is None:
+            output_query_mask = query_mask
+        if output_query_mask is not None:
+            output_query_mask = output_query_mask.to(pooled.device)
         task_type_ids = inputs.get("task_type_ids")
         if task_type_ids is None:
             task_type_ids = torch.zeros(
@@ -714,7 +742,13 @@ class JointPretrainingModel(PreTrainedModel):
         classification_mask = binary_mask | multiclass_mask
 
         task_logits = self.task_classifier(pooled)
-        binary_logits = task_logits[:, 0] if task_logits.dim() == 2 else task_logits
+        pooled_primary = pooled[:, 0] if pooled.dim() == 3 else pooled
+        if pooled.dim() == 3 and output_query_mask is not None:
+            summary_mask = output_query_mask.to(pooled.dtype)
+            pooled_primary = (
+                pooled * summary_mask.unsqueeze(-1)
+            ).sum(dim=1) / summary_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        binary_logits = self.task_classifier(pooled_primary).reshape(-1)
 
         loss_terms = []
         if binary_mask.any():
@@ -726,7 +760,6 @@ class JointPretrainingModel(PreTrainedModel):
         else:
             binary_loss = pooled.sum() * 0.0
 
-        pooled_primary = pooled[:, 0] if pooled.dim() == 3 else pooled
         survival_logits = self.task_survival_head(pooled_primary)
         tte_mask = (task_type_ids == TASK_TYPE_TTE) & task_loss_mask
         if tte_mask.any():
@@ -745,9 +778,14 @@ class JointPretrainingModel(PreTrainedModel):
             tte_loss = survival_logits.sum() * 0.0
 
         if multiclass_mask.any():
-            multiclass_query_mask = query_mask[multiclass_mask] if query_mask is not None else None
+            multiclass_logits = task_logits[:, 2:] if task_logits.dim() == 2 else task_logits
+            multiclass_query_mask = (
+                output_query_mask[multiclass_mask, 2:]
+                if output_query_mask is not None and output_query_mask.dim() == 2
+                else None
+            )
             multiclass_loss = query_classification_loss(
-                task_logits[multiclass_mask],
+                multiclass_logits[multiclass_mask],
                 labels[multiclass_mask].long(),
                 query_mask=multiclass_query_mask,
             )
@@ -764,7 +802,7 @@ class JointPretrainingModel(PreTrainedModel):
             "logits": binary_logits,
             "task_logits": task_logits,
             "survival_logits": survival_logits,
-            "multiclass_logits": task_logits,
+            "multiclass_logits": task_logits[:, 2:] if task_logits.dim() == 2 else task_logits,
             "labels": labels,
             "binary_mask": binary_mask,
             "classification_mask": classification_mask,
@@ -1193,7 +1231,7 @@ def load_cached_query_names(cache_root: str):
         manifest_path = os.path.join(cache_root, split, "manifest.json")
         if not os.path.exists(manifest_path):
             raise FileNotFoundError(
-                f"Unified pretraining manifest not found: {manifest_path}. "
+                f"EHR encoder pretraining manifest not found: {manifest_path}. "
                 "Run scripts/preprocess/build_unified_pretrain_cache.sh first."
             )
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -1273,34 +1311,42 @@ def build_task_class_query_tensors(
 def main():
     parser = HfArgumentParser((DataArguments, PretrainingArguments))
     data_args, training_args = parser.parse_args_into_dataclasses()
+    pretraining_input_dir = (
+        data_args.unified_preprocessed_input_dir
+        or data_args.pretraining_input_dir
+    )
     os.environ.setdefault("MIMIC_SKIP_SAMPLE_CACHE_CHECK", "1")
     set_seed(training_args.seed)
 
     text_dim, text_to_idx, embedding_matrix = pml.load_table_embeddings(
-        embedding_cache_paths(data_args)
+        embedding_cache_paths(data_args),
+        merged_cache_path=data_args.merged_table_embedding_cache,
     )
+    if pml.local_rank0():
+        print("Table embeddings ready.", flush=True)
     type_vocab = pml.load_type_vocab(data_args.type_vocab_file)
     task_names, content_task_names = load_cached_query_names(
-        data_args.unified_preprocessed_input_dir
+        pretraining_input_dir
     )
     task_num_classes = load_cached_task_num_classes(
-        data_args.unified_preprocessed_input_dir,
+        pretraining_input_dir,
         task_names,
     )
     task_info = tqc.get_task_info()
-    task_query_texts = {
-        task_name: task_info.get(task_name, {}).get(
-            "instruction",
-            "Self-supervised pretraining context from one hospital encounter.",
-        )
-        for task_name in content_task_names
-    }
+    task_query_texts = {}
     for task_name in task_names:
         info = task_info.get(task_name)
+        task_query_texts[task_name] = (
+            info.get("instruction")
+            if info and info.get("instruction")
+            else "Self-supervised pretraining context from one hospital encounter."
+        )
         if not info or info.get("task_type") not in {"binary_classification", "multi_class_classification"}:
             continue
         task_query_texts.update(tqc.build_class_query_texts(task_name, info))
     task_query_texts.update(FORMAT_QUERY_TEXTS)
+    if pml.local_rank0():
+        print(f"Loading task query embeddings: {len(task_query_texts)} texts.", flush=True)
     task_query_embeddings = pml.build_knowledge_query_embeddings(
         query_texts=task_query_texts,
         cache_path=data_args.task_query_embedding_cache,
@@ -1309,11 +1355,15 @@ def main():
         max_length=data_args.query_max_length,
         batch_size=data_args.query_embedding_batch_size,
     )
+    if pml.local_rank0():
+        print("Task query embeddings ready.", flush=True)
 
     phenotype_specs = pml.load_query_specs(data_args.phenotype_spec_path)
     phenotype_query_texts = {
         spec.key: spec.query_text for spec in phenotype_specs
     }
+    if pml.local_rank0():
+        print(f"Loading phenotype query embeddings: {len(phenotype_query_texts)} texts.", flush=True)
     phenotype_query_embeddings = pml.build_knowledge_query_embeddings(
         query_texts=phenotype_query_texts,
         cache_path=data_args.phenotype_query_embedding_cache,
@@ -1322,6 +1372,8 @@ def main():
         max_length=data_args.query_max_length,
         batch_size=data_args.query_embedding_batch_size,
     )
+    if pml.local_rank0():
+        print("Phenotype query embeddings ready.", flush=True)
     phenotype_query_embedding_matrix = torch.stack(
         [phenotype_query_embeddings[spec.key] for spec in phenotype_specs],
         dim=0,
@@ -1366,15 +1418,15 @@ def main():
         training_args=training_args,
     )
 
-    train_dataset = PreprocessedUnifiedTaskDataset(
-        cache_root=data_args.unified_preprocessed_input_dir,
+    train_dataset = PreprocessedPretrainingTaskDataset(
+        cache_root=pretraining_input_dir,
         split="train",
         task_query_embeddings=task_query_embeddings,
         phenotype_specs=phenotype_specs,
         text_to_idx=text_to_idx,
     )
-    eval_dataset = PreprocessedUnifiedTaskDataset(
-        cache_root=data_args.unified_preprocessed_input_dir,
+    eval_dataset = PreprocessedPretrainingTaskDataset(
+        cache_root=pretraining_input_dir,
         split="val",
         task_query_embeddings=task_query_embeddings,
         phenotype_specs=phenotype_specs,
@@ -1382,7 +1434,7 @@ def main():
     )
     collator = PreprocessedUnifiedTaskCollator(
         task_query_embeddings=task_query_embeddings,
-        content_task_names=content_task_names,
+        task_names=task_names,
         format_query_embeddings=task_query_embeddings,
         task_class_query_embeddings=task_class_query_embeddings,
         task_class_query_mask=task_class_query_mask,
@@ -1391,7 +1443,7 @@ def main():
     )
 
     print(f"Unified cached train/val: {len(train_dataset)}/{len(eval_dataset)}")
-    print(f"Task queries: content={len(content_task_names)}, output_tasks={len(task_names)}, formats=3")
+    print(f"Task queries: instructions={len(task_names)}, content={len(content_task_names)}, formats=3")
     print(f"Knowledge query dimension: {task_query_dim}")
     print(f"Phenotype metric queries: {len(phenotype_specs)}")
 

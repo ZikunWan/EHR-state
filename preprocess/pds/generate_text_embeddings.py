@@ -217,7 +217,7 @@ def parse_args():
         "--base-model-path",
         default="/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT",
     )
-    parser.add_argument("--cache-dir", default="/data/zikun_workspace/.cache/embeddings/PDS")
+    parser.add_argument("--cache-dir", default="/data/zikun_workspace/input/cache/embeddings/PDS")
     parser.add_argument("--harvest-checkpoint", default="")
     parser.add_argument("--final-output", default="")
     parser.add_argument("--batch-size", type=int, default=512)

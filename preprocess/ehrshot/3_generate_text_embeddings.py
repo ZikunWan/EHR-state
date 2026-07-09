@@ -6,15 +6,15 @@ Usage:
 
     torchrun --nproc_per_node=4 preprocess/ehrshot/3_generate_text_embeddings.py --stage encode \
         --model-path /data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT \
-        --final-output /data/zikun_workspace/.cache/embeddings/ehrshot/text_embeddings_clinicalbert.pt
+        --final-output /data/zikun_workspace/input/cache/embeddings/ehrshot/text_embeddings_clinicalbert.pt
 
     torchrun --nproc_per_node=4 preprocess/ehrshot/3_generate_text_embeddings.py --stage encode \
         --model-path /data/zikun_workspace/checkpoints/pretraining/text_encoder_stage1/epoch_100.pt \
-        --final-output /data/zikun_workspace/.cache/embeddings/ehrshot/text_embeddings_stage1.pt
+        --final-output /data/zikun_workspace/input/cache/embeddings/ehrshot/text_embeddings_stage1.pt
 
     torchrun --nproc_per_node=8 preprocess/ehrshot/3_generate_text_embeddings.py --stage encode \
         --model-path /data/zikun_workspace/checkpoints/pretraining/text_encoder_stage2/epoch_5.pt \
-        --final-output /data/zikun_workspace/.cache/embeddings/ehrshot/text_embeddings_stage2.pt
+        --final-output /data/zikun_workspace/input/cache/embeddings/ehrshot/text_embeddings_stage2.pt
 """
 import argparse
 import os
@@ -334,7 +334,7 @@ def parse_args():
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/data/zikun_workspace/.cache/embeddings/ehrshot",
+        default="/data/zikun_workspace/input/cache/embeddings/ehrshot",
         help="Embedding cache dir.",
     )
     parser.add_argument(

@@ -27,7 +27,6 @@ from dataset.renji.renji_dataset import RenjiDataset
 from dataset.renji.task_info import get_task_info as get_renji_task_info
 from models.TableEncoder.config import LongTableEncoder1DConfig
 from models.encoder_classifier import EncoderClassifierModel
-from outdated import task_query_classification as tqc
 from train.classification.train_encoder_classifier import (
     RENJI_ACTIVE_POINTS,
     build_query_tensor,
@@ -64,8 +63,8 @@ class DataArguments:
     task_name: str = field(default="")
     embedding_cache: str = field(default="")
     type_vocab_file: str = field(default="data/type_vocab.json")
-    query_embedding_cache: str = field(default="/data/zikun_workspace/.cache/embeddings/query_classifier/task_query_embeddings.pt")
-    knowledge_encoder_path: str = field(default="/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/clinicalBERT_after_stage2/best.pt")
+    query_embedding_cache: str = field(default="/data/zikun_workspace/input/cache/embeddings/query_classifier/task_query_embeddings.pt")
+    knowledge_encoder_path: str = field(default="/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/best.pt")
     knowledge_encoder_base_model_path: str = field(default="/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT")
     query_max_length: int = field(default=512)
     max_table_len: Optional[int] = field(default=None)

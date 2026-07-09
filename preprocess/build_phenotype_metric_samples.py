@@ -46,7 +46,7 @@ _WORKER_PROGRESS_UPDATE_INTERVAL = None
 @dataclass
 class InputPrecomputeArguments:
     output_dir: str = field(
-        default="/data/zikun_workspace/.cache/phenotype_metric_learning/inputs"
+        default="/data/zikun_workspace/input/cache/pretraining/phenotype_metric_learning/inputs"
     )
     splits: List[str] = field(default_factory=lambda: ["train", "val"])
     num_workers: int = field(default=32)
