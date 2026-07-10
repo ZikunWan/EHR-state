@@ -3,7 +3,7 @@ set -euo pipefail
 source "$(dirname "$0")/../common/silent_info.sh"
 
 MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py \
-    --deepspeed "./ds_config_zero3.json" \
+    --deepspeed "./ds_config_zero2.json" \
     --dataset mimic_iv eicu ehrshot \
     --root_dir "/data/zikun_workspace/mimic-iv-3.1_tabular" \
     --eicu_root_dir "/data/zikun_workspace/eicu-crd" \
@@ -26,6 +26,11 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py
     --per_device_train_batch_size 32 \
     --per_device_eval_batch_size 32 \
     --gradient_accumulation_steps 1 \
+    --activation_checkpointing false \
+    --grad_cache true \
+    --grad_cache_micro_batch_size 8 \
+    --length_grouped_batching true \
+    --text_embedding_on_gpu true \
     --dataloader_num_workers 4 \
     --learning_rate 1e-5 \
     --lr_scheduler_type "cosine" \
@@ -42,9 +47,9 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py
     --relation_l2_weight 0.0 \
     --min_pair_delta 0.0 \
     --num_train_epochs 1 \
-    --logging_steps 10 \
-    --save_steps 5000 \
-    --eval_strategy "steps" \
+    --logging_steps 1 \
+    --save_steps 1000 \
+    --eval_strategy "no" \
     --eval_steps 5000 \
     --save_total_limit 1 \
     --metric_for_best_model "eval_loss" \

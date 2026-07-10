@@ -233,7 +233,7 @@ def _init_ehrshot_table_length_worker(root_dir):
     worker_dataset = EHRSHOTDataset.__new__(EHRSHOTDataset)
     worker_dataset.root_dir = root_dir
     worker_dataset.ehr_dir = os.path.join(root_dir, "patients")
-    code_2_description_path = os.path.join(root_dir, "utils/code_2_description.json")
+    code_2_description_path = "/data/zikun_workspace/input/cache/ehrshot/utils/code_2_description.json"
     with open(code_2_description_path, 'r', encoding='utf-8') as f:
         worker_dataset.code_2_description = json.load(f)
     worker_dataset.code_2_description.update(AGGREGATED_MAPPING)
@@ -444,7 +444,7 @@ class EHRSHOTDataset(Dataset):
 
     def get_code_mapping(self):
         # Load unified code-to-description mapping from JSON
-        code_2_description_path = os.path.join(self.root_dir, 'utils/code_2_description.json')
+        code_2_description_path = "/data/zikun_workspace/input/cache/ehrshot/utils/code_2_description.json"
         with open(code_2_description_path, 'r', encoding='utf-8') as f:
             self.code_2_description = json.load(f)
         self.code_2_description.update(AGGREGATED_MAPPING)

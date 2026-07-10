@@ -46,7 +46,7 @@ class ModelArguments:
 class DataArguments:
     data_dir: str = field(default="/data/zikun_workspace/input/tables/renji/raw")
     embedding_cache: str = field(
-        default="/data/zikun_workspace/input/cache/embeddings/renji/text_embeddings_stage2.pt"
+        default="/data/zikun_workspace/input/cache/embeddings/renji/text_embeddings.pt"
     )
     checkpoint_dir: str = field(
         default="/data/zikun_workspace/checkpoints/renji/tacrolimus_survival"
@@ -66,8 +66,7 @@ class DataArguments:
         "renji_survival_task_query_knowledge_embeddings.pt"
     )
     knowledge_encoder_path: str = field(
-        default="/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/"
-        "clinicalBERT_after_stage2/best.pt"
+        default="/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/best.pt"
     )
     knowledge_encoder_base_model_path: str = field(
         default="/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT"

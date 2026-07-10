@@ -81,18 +81,18 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 python ./preprocess/build_unified_pretrain_cache
     --table_text_embedding "/data/zikun_workspace/input/cache/embeddings/mimic_iv/text_embeddings.pt" \
     --eicu_table_text_embedding "/data/zikun_workspace/input/cache/embeddings/eicu/text_embeddings.pt" \
     --ehrshot_table_text_embedding "/data/zikun_workspace/input/cache/embeddings/ehrshot/text_embeddings.pt" \
-    --task_train_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/index/train" \
-    --task_val_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/index/val" \
+    --task_train_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/train" \
+    --task_val_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/val" \
     --eicu_task_train_sample_info_path "/data/zikun_workspace/eicu-crd/processed/sample_info_train.json" \
     --eicu_task_val_sample_info_path "/data/zikun_workspace/eicu-crd/processed/sample_info_val.json" \
-    --ehrshot_task_train_sample_info_path "/data/zikun_workspace/input/tasks/classification/ehrshot/indices/ehrshot_train.csv" \
-    --ehrshot_task_val_sample_info_path "/data/zikun_workspace/input/tasks/classification/ehrshot/indices/ehrshot_val.csv" \
-    --pretraining_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/index/train/next_token_prediction.csv" \
-    --pretraining_val_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/index/val/next_token_prediction.csv" \
+    --ehrshot_task_train_sample_info_path "/data/zikun_workspace/input/cache/ehrshot/classification_sample_info/ehrshot_train.csv" \
+    --ehrshot_task_val_sample_info_path "/data/zikun_workspace/input/cache/ehrshot/classification_sample_info/ehrshot_val.csv" \
+    --pretraining_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/train/next_token_prediction.csv" \
+    --pretraining_val_sample_info_path "/data/zikun_workspace/input/tasks/classification/mimic_iv/val/next_token_prediction.csv" \
     --eicu_pretraining_sample_info_path "/data/zikun_workspace/eicu-crd/processed/pretraining_index/sample_info_train.json" \
     --eicu_pretraining_val_sample_info_path "/data/zikun_workspace/eicu-crd/processed/pretraining_index/sample_info_val.json" \
-    --ehrshot_pretraining_sample_info_path "/data/zikun_workspace/input/tables/ehrshot/pretraining_index/sample_info_train.csv" \
-    --ehrshot_pretraining_val_sample_info_path "/data/zikun_workspace/input/tables/ehrshot/pretraining_index/sample_info_val.csv" \
+    --ehrshot_pretraining_sample_info_path "/data/zikun_workspace/input/tasks/pretraining/ehrshot/indices/sample_info_train.csv" \
+    --ehrshot_pretraining_val_sample_info_path "/data/zikun_workspace/input/tasks/pretraining/ehrshot/indices/sample_info_val.csv" \
     --include_pretraining_context true \
     --tte_index_dir "/data/zikun_workspace/input/tasks/time_to_event" \
     --phenotype_spec_path "/data/zikun_workspace/input/cache/pretraining/phenotype_metric_learning/phenotype_query_specs.json" \

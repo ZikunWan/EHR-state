@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import ast
 import random
 import time
 import warnings
@@ -85,8 +86,7 @@ class EICUDataset(Dataset):
         self.table_length_cache_file = os.path.join(self.table_length_cache_dir, f"{sample_info_name}.table_length.json")
 
         if sample_info is None:
-            with open(sample_info_path, "r", encoding="utf-8") as f:
-                self.sample_info = json.load(f)
+            self.sample_info = self._load_sample_info(sample_info_path)
         else:
             self.sample_info = list(sample_info)
 
@@ -110,6 +110,18 @@ class EICUDataset(Dataset):
         if not self.lazy_mode:
             for idx in tqdm(range(len(self.sample_info)), desc="Pre-processing"):
                 self.data.append(self._process_item(idx))
+
+    def _load_sample_info(self, sample_info_path):
+        if str(sample_info_path).endswith(".csv"):
+            df = pd.read_csv(sample_info_path)
+            records = df.to_dict(orient="records")
+            for record in records:
+                label = record.get("label")
+                if isinstance(label, str) and label.strip().startswith("["):
+                    record["label"] = ast.literal_eval(label)
+            return records
+        with open(sample_info_path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     def _table_length_cache_key(self, sample_info):
         return _eicu_table_length_cache_key_from_sample(sample_info)

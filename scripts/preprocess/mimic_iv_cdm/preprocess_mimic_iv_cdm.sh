@@ -1,17 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 
-MIMIC_HOSP_DIR="/data/zikun_workspace/mimic-iv-3.1/hosp"
+MIMIC_HOSP_DIR="/data/EHR_data_public/mimic-iv-3.1/hosp"
 CDM_ROOT_DIR="/data/EHR_data_public/mimic-iv-cdm"
-INDEX_DIR="/data/zikun_workspace/input/tasks/classification/mimic_iv_cdm/index"
+INDEX_DIR="/data/zikun_workspace/input/tasks/classification/mimic_iv_cdm"
 PATIENT_DIR="/data/zikun_workspace/input/metadata/splits/mimic_iv_cdm"
 
 python preprocess/mimic_iv_cdm/1_generate_sample_info.py \
   --root_dir "${CDM_ROOT_DIR}" \
+  --admissions_path "${MIMIC_HOSP_DIR}/admissions.csv.gz" \
   --output_index_dir "${INDEX_DIR}" \
   --output_patient_dir "${PATIENT_DIR}" \
   --categories "appendicitis,cholecystitis,diverticulitis,pancreatitis" \
   --train_ratio 0.8 \
+  --val_ratio 0.1 \
   --random_seed 42
 
 python preprocess/mimic_iv_cdm/2_generate_microbiology_mapping.py \

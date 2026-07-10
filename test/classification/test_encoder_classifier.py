@@ -141,6 +141,7 @@ def build_eval_dataset(data_args: DataArguments):
             shuffle=False,
             max_samples=data_args.max_eval_samples,
             target_prediction_points=RENJI_ACTIVE_POINTS,
+            task_name=data_args.task_name,
         )
     if data_args.dataset_name == "pds":
         if data_args.patient_split_path is None or not str(data_args.patient_split_path).strip():
@@ -178,12 +179,15 @@ def main():
     model_args, data_args = parser.parse_args_into_dataclasses()
     set_seed(data_args.seed)
 
-    is_multi_query_dataset = data_args.dataset_name == "renji"
-    if is_multi_query_dataset:
-        task_info = get_dataset_task_info(data_args.dataset_name)[data_args.task_name or "candidate_metric_prediction"]
-        query_texts = build_renji_query_texts()
-        query_key = f"{data_args.dataset_name}:{data_args.task_name or 'candidate_metric_prediction'}"
+    if data_args.dataset_name == "renji":
+        if data_args.task_name not in RenjiDataset.ALL_METRICS:
+            raise ValueError(f"--task_name for Renji must be one of {RenjiDataset.ALL_METRICS}; got {data_args.task_name!r}")
+        is_multi_query_dataset = False
+        task_info = get_dataset_task_info(data_args.dataset_name)["single_metric_prediction"]
+        query_texts = build_renji_query_texts(data_args.task_name)
+        query_key = f"{data_args.dataset_name}:single_metric_prediction:{data_args.task_name}"
     else:
+        is_multi_query_dataset = False
         task_info = get_dataset_task_info(data_args.dataset_name)[data_args.task_name]
         if data_args.dataset_name == "pds":
             task_info = dict(task_info)
@@ -209,7 +213,7 @@ def main():
         knowledge_encoder_path=data_args.knowledge_encoder_path,
         knowledge_encoder_base_model_path=data_args.knowledge_encoder_base_model_path,
     )
-    if not is_multi_query_dataset:
+    if not is_multi_query_dataset and data_args.dataset_name != "renji":
         query_tensor, label_map = build_query_tensor(query_key, task_info, embeddings_by_text)
     else:
         label_map = None
@@ -239,12 +243,15 @@ def main():
         )
         binary_output = True
     else:
+        query_tensor_arg = None if data_args.dataset_name == "renji" else query_tensor
+        query_embeddings_by_text_arg = embeddings_by_text if data_args.dataset_name == "renji" else None
         collator = create_query_classifier_collate_fn(
             type_vocab,
             max_table_len=data_args.max_table_len,
             text_to_idx=text_to_idx,
             pad_idx=pad_idx,
-            query_embeds=query_tensor,
+            query_embeds=query_tensor_arg,
+            query_embeddings_by_text=query_embeddings_by_text_arg,
             label_map=label_map,
         )
         binary_output = task_info.get("task_type") == "binary_classification"

@@ -74,7 +74,8 @@ def harvest_worker(worker_args):
     local_unique = set()
     for sample_idx in slice_list:
         index_item = dataset.list_data[sample_idx]
-        cur_item = dataset.raw_data[index_item["category"]][index_item["hadm_id"]]
+        label = dataset._sample_label(index_item)
+        cur_item = dataset.raw_data[label][index_item["hadm_id"]]
         df = dataset.structed_EHR_input_process(cur_item)
         local_unique.update(collect_table_texts(df))
     return part_idx, local_unique
@@ -122,7 +123,7 @@ def harvest_unique_texts(root_dir, index_dir, splits, task_name, harvest_checkpo
 
         unique_slices = {}
         for i, index_item in enumerate(dataset.list_data):
-            key = (index_item["category"], index_item["hadm_id"])
+            key = (dataset._sample_label(index_item), index_item["hadm_id"])
             if key not in unique_slices:
                 unique_slices[key] = i
 
@@ -333,14 +334,14 @@ def parse_args():
     parser.add_argument(
         "--splits",
         nargs="+",
-        default=["train", "test"],
+        default=["train", "val", "test"],
         help="Splits to harvest from index CSVs.",
     )
     parser.add_argument(
         "--index-dir",
         type=str,
-        default=None,
-        help="Directory containing mimiciv_cdm_<split>.csv. Defaults to <root-dir>/index.",
+        default="/data/zikun_workspace/input/tasks/classification/mimic_iv_cdm",
+        help="Directory containing mimiciv_cdm_<split>.csv.",
     )
     parser.add_argument(
         "--task-name",

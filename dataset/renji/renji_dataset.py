@@ -115,6 +115,9 @@ class RenjiDataset(Dataset):
                  target_metrics=None,
                  target_prediction_points=None,
                  shuffle=False,
+                 index_dir=None,
+                 split_json_dir=None,
+                 task_name=None,
                  ):
         """
         Initialize RenjiDataset.
@@ -137,21 +140,52 @@ class RenjiDataset(Dataset):
         self.active_points = list(target_prediction_points) if target_prediction_points is not None else list(self.ALL_POINTS)
         self.shuffle = shuffle
         self.task_schema = get_task_info()
+        self.task_name = task_name or (self.target_metrics[0] if self.target_metrics else None)
+        if self.task_name not in self.ALL_METRICS:
+            raise ValueError(f"Renji classification task_name must be one of {self.ALL_METRICS}; got {self.task_name!r}")
+        self.target_metrics = [self.task_name]
         
         self.followup_dir = os.path.join(self.root_dir, 'follow_ups')
-        self.index_dir = os.path.join(self.root_dir, 'index')
+        self.index_dir = index_dir or "/data/zikun_workspace/input/tasks/classification/renji"
+        self.split_json_dir = split_json_dir or "/data/zikun_workspace/input/metadata/splits/renji/json"
         self.measurement_cache_dir = os.path.join(self.root_dir, "cache", "measurement_table")
         
         self._init_configs()
         self._load_auxiliary_data()
         
-        # Load split file list
-        split_path = os.path.join(self.index_dir, f'{split}_renji.json')
-        with open(split_path, 'r', encoding='utf-8') as f:
-            self.filenames = json.load(f)
-        
         self._valid_followup_cache = {}
-        self.samples = self._build_index()
+        task_index_path = self._classification_index_path()
+        if os.path.exists(task_index_path):
+            self.samples = self._load_task_index(task_index_path)
+        else:
+            self.filenames = self._load_split_filenames()
+            self.samples = self._build_index()
+
+    def _classification_index_path(self):
+        return os.path.join(self.index_dir, self.split, f"{self.task_name}.csv")
+
+    def _load_split_filenames(self):
+        split_path = os.path.join(self.split_json_dir, f"{self.split}_renji.json")
+        if not os.path.exists(split_path):
+            split_path = os.path.join(self.root_dir, "index", f"{self.split}_renji.json")
+        with open(split_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _load_task_index(self, index_path):
+        _rank0_print(f"[{self.split}] Loading Renji classification index: {index_path}")
+        index_df = pd.read_csv(index_path)
+        samples = index_df.to_dict(orient="records")
+        for sample in samples:
+            sample["cutoff_day"] = int(sample["cutoff_day"])
+            sample["label"] = int(sample["label"])
+        if self.max_samples and len(samples) > self.max_samples:
+            samples = self._balanced_sample(samples, self.max_samples)
+            np.random.shuffle(samples)
+            samples = samples[:self.max_samples]
+        if self.shuffle:
+            np.random.shuffle(samples)
+        self._print_stats(samples)
+        return samples
 
     def _init_configs(self):
         """Initialize feature configurations."""
@@ -749,9 +783,9 @@ class RenjiDataset(Dataset):
     def _build_index(self):
         """
         Build sample index.
-        - One sample per (patient, prediction_point) with point-specific multi-label supervision.
+        - One sample per (patient, prediction_point, metric) with single-label supervision.
         """
-        _rank0_print(f"[{self.split}] Building sample index (mode=candidate_metric)...")
+        _rank0_print(f"[{self.split}] Building sample index (mode=single_metric, metric={self.task_name})...")
         
         # Determine which prediction points to use
         active_points = self.active_points
@@ -768,9 +802,11 @@ class RenjiDataset(Dataset):
             if pd.isna(dob):
                 continue
             
-            # For each prediction point
             for point_key in active_points:
                 cutoff_day, label_prefix, readable_point = self.PREDICTION_POINTS[point_key]
+                label_col = f"{label_prefix}_{self.task_name}"
+                if label_col not in patient_labels or pd.isna(patient_labels[label_col]):
+                    continue
                 sample_base = {
                     'fname': fname,
                     'fname_key': fname_key,
@@ -780,13 +816,11 @@ class RenjiDataset(Dataset):
                 }
                 sample = {
                     **sample_base,
-                    'metric': 'all',
-                    'label_col': 'all',
-                    'label_val': -100,
+                    'metric': self.task_name,
+                    'label_col': label_col,
+                    'label': int(patient_labels[label_col]),
                 }
                 if not self._has_valid_followup_after_birth(sample, dob):
-                    continue
-                if not self._has_any_valid_multilabel_target(patient_labels, point_key):
                     continue
                 samples.append(sample)
                         
@@ -855,10 +889,9 @@ class RenjiDataset(Dataset):
             for metric, count in metric_dist.most_common(10):
                 _rank0_print(f"  {metric}: {count}")
         
-        # Label distribution is only meaningful for single-label samples.
-        if samples and 'label_val' in samples[0] and any(s['label_val'] in {0, 1} for s in samples):
-            label_0 = sum(1 for s in samples if s['label_val'] == 0)
-            label_1 = sum(1 for s in samples if s['label_val'] == 1)
+        if samples and 'label' in samples[0]:
+            label_0 = sum(1 for s in samples if s['label'] == 0)
+            label_1 = sum(1 for s in samples if s['label'] == 1)
             if label_0 > 0:
                 _rank0_print(f"\nLabel distribution: 0={label_0}, 1={label_1}, ratio={label_1/(label_0):.2f}")
             else:
@@ -1070,57 +1103,28 @@ class RenjiDataset(Dataset):
         report_date = pd.to_datetime(df_followup['报告日期'].iloc[0])
         age_years = (report_date - dob).days / 365.25
         
-        # PREPARE TARGETS
-        labels_matrix = torch.full((len(self.active_points), len(self.ALL_METRICS)), -100, dtype=torch.float32)
-
-        patient_labels = self.labels_df.loc[sample['fname_key']]
-        target_point_idx = self.active_points.index(prediction_point)
-        _, target_prefix, _ = self.PREDICTION_POINTS[prediction_point]
-        for m_idx, met in enumerate(self.ALL_METRICS):
-            col_name = f"{target_prefix}_{met}"
-            if col_name in patient_labels and pd.notna(patient_labels[col_name]):
-                labels_matrix[target_point_idx, m_idx] = float(patient_labels[col_name])
-
-        candidate_tasks = []
-        for m_idx, met in enumerate(self.ALL_METRICS):
-            label_value = labels_matrix[target_point_idx, m_idx]
-            if label_value == -100:
-                continue
-            query = (
-                f"Task: predict future {met} abnormality during {label_prefix} "
-                f"after liver transplantation using clinical history up to "
-                f"{readable_point} post-transplant."
-            )
-            candidate_tasks.append(
-                {
-                    "query": query,
-                    "candidates": ["no", "yes"],
-                    "label": int(label_value.item()),
-                    "point": readable_point,
-                    "point_key": prediction_point,
-                    "point_index": target_point_idx,
-                    "metric": met,
-                    "metric_index": m_idx,
-                    "window": label_prefix,
-                }
-            )
-
-        output_label = labels_matrix
-        task_info = deepcopy(self.task_schema["candidate_metric_prediction"])
+        metric = sample["metric"]
+        output_label = int(sample["label"])
+        task_info = deepcopy(self.task_schema["single_metric_prediction"])
         instruction = task_info["instruction_template"].format(
             prediction_point=f"{readable_point} post-transplant",
+            metric=metric,
+            label_window=label_prefix,
         )
         task_info.update(
             {
-                "task": "candidate_metric",
+                "task": "single_metric_prediction",
+                "metric": metric,
                 "prediction_point": readable_point,
+                "prediction_point_key": prediction_point,
                 "label_window": label_prefix,
                 "window": label_prefix,
                 "instruction": instruction,
+                "label": output_label,
             }
         )
         final_table = self._cached_measurement_table(
-            ["candidate_metric", fname_key, prediction_point, cutoff_day],
+            ["single_metric", metric, fname_key, prediction_point, cutoff_day],
             static_features,
             df_followup,
             surgery_date,
@@ -1136,7 +1140,10 @@ class RenjiDataset(Dataset):
             "output": output_label if isinstance(output_label, torch.Tensor) else str(output_label),
             "task_info": task_info,
             "measurement_table": final_table,
-            "candidate_tasks": candidate_tasks,
+            "label": output_label,
+            "metric": metric,
+            "prediction_point": prediction_point,
+            "label_window": label_prefix,
         }
         
         output_sample["candidates"] = ["no", "yes"]
@@ -1317,8 +1324,8 @@ class RenjiTacrolimusSurvivalDataset(RenjiDataset):
         self.samples = self._build_index()
 
     def _index_path(self):
-        index_dir = self.tte_index_dir or self.index_dir
-        return os.path.join(index_dir, f"tacrolimus_tte_{self.split}.csv")
+        index_dir = self.tte_index_dir or "/data/zikun_workspace/input/tasks/time_to_event/renji"
+        return os.path.join(index_dir, self.split, "tacrolimus_abnormal_survival.csv")
 
     def _load_index_rows(self):
         index_path = self._index_path()
@@ -1524,8 +1531,8 @@ class RenjiDeathSurvivalDataset(RenjiDataset):
         _rank0_print(f"Loaded patient info: {len(self.patient_info_map)} patients")
 
     def _index_path(self):
-        index_dir = self.tte_index_dir or self.index_dir
-        return os.path.join(index_dir, f"death_tte_{self.split}.csv")
+        index_dir = self.tte_index_dir or "/data/zikun_workspace/input/tasks/time_to_event/renji"
+        return os.path.join(index_dir, self.split, "death_survival.csv")
 
     def _build_index(self):
         index_path = self._index_path()

@@ -71,9 +71,8 @@ class FlashAttention(nn.Module):
             k = repeat_kv(k, self.num_key_value_groups)
             v = repeat_kv(v, self.num_key_value_groups)
 
-        # Handle mask for SDPA
-        # Use float mask (-inf for masked positions, 0.0 for valid) instead of bool,
-        # which is compatible with all SDPA backends (flash, mem_efficient, math).
+        # Keep padding and causal masking separate so SDPA can use its optimized
+        # causal path without materializing a [batch, seq_len, seq_len] mask.
         attn_mask = None
         if mask is not None:
             if mask.dim() == 2:
@@ -82,15 +81,8 @@ class FlashAttention(nn.Module):
                 attn_mask = mask.contiguous().view(batch_size, 1, seq_len, seq_len)  # [B, 1, N, N]
             else:
                 attn_mask = mask
-            # Use a bool mask (True = attend, False = ignore).
-            # SDPA accepts bool masks and can still select Flash / mem_efficient backends,
-            # whereas a float additive mask (with -inf) forces the O(N²) Math backend.
+            # SDPA bool masks use True = attend and False = ignore.
             attn_mask = attn_mask.bool()
-
-        if causal:
-            causal_mask = torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool).tril()
-            causal_mask = causal_mask.view(1, 1, seq_len, seq_len)
-            attn_mask = causal_mask if attn_mask is None else attn_mask & causal_mask
 
         # Flash Attention has a known backward bug for short sequences. Use mem_efficient backend which:
         #   - avoids Flash Attention's small-seq backward CUDA bug
@@ -103,7 +95,7 @@ class FlashAttention(nn.Module):
                     q, k, v,
                     attn_mask=attn_mask,
                     dropout_p=self.attn_drop_prob if self.training else 0.0,
-                    is_causal=False
+                    is_causal=causal,
                 )
         else:
             # seq_len >= 64: let SDPA auto-select Flash Attention (O(N) memory)
@@ -111,7 +103,7 @@ class FlashAttention(nn.Module):
                 q, k, v,
                 attn_mask=attn_mask,  # bool mask → Flash Attention can be selected
                 dropout_p=self.attn_drop_prob if self.training else 0.0,
-                is_causal=False
+                is_causal=causal,
             )
 
         x = x.transpose(1, 2).contiguous().reshape(batch_size, seq_len, hidden_dim)

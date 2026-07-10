@@ -11,7 +11,7 @@ from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 
 
 DEFAULT_DATA_DIR = "/data/zikun_workspace/input/tables/renji/raw"
-DEFAULT_SAVE_DIR = f"{DEFAULT_DATA_DIR}/index"
+DEFAULT_SAVE_DIR = "/data/zikun_workspace/input/metadata/splits/renji/json"
 
 LABEL_WINDOWS = ["0-30d", "30-180d", "180-365d", "365d+"]
 

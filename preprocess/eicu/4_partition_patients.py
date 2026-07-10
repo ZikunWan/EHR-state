@@ -28,10 +28,13 @@ Next Step:
 
 ==============================================================================
 """
+import argparse
 import os
-import pandas as pd
-from tqdm import tqdm
 import multiprocessing as mp
+
+import pandas as pd
+import yaml
+from tqdm import tqdm
 
 def write_patient_group(args):
     """Worker function to write a single patient's dataframe to disk"""
@@ -79,8 +82,15 @@ def process_table(table_path, out_dir, num_workers=8):
     print(f"[{table_name}] Finished successfully.")
 
 def main():
-    raw_dir = "/home/ma-user/sfs_turbo/Data/eicu-crd/2.0"
-    out_dir = "/home/ma-user/sfs_turbo/sai6/zkwan/eicu-crd/processed/patients"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="preprocess/eicu/config.yaml")
+    args = parser.parse_args()
+
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f)
+
+    raw_dir = config["data_dir"]
+    out_dir = os.path.join(config["output_dir"], "patients")
     os.makedirs(out_dir, exist_ok=True)
     
     tables = ["patient.csv", "lab.csv", "medication.csv", "infusionDrug.csv"]

@@ -121,19 +121,19 @@ def get_dataset_task_info(dataset_name: str):
 
 def renji_query(point_key: str, metric: str) -> str:
     _, label_prefix, readable_point = RenjiDataset.PREDICTION_POINTS[point_key]
-    return (
-        f"Task: predict future {metric} abnormality during {label_prefix} "
-        f"after liver transplantation using clinical history up to "
-        f"{readable_point} post-transplant."
+    task_info = get_renji_task_info()["single_metric_prediction"]
+    return task_info["instruction_template"].format(
+        prediction_point=f"{readable_point} post-transplant",
+        metric=metric,
+        label_window=label_prefix,
     )
 
 
-def build_renji_query_texts() -> dict[str, str]:
+def build_renji_query_texts(metric: str) -> dict[str, str]:
     texts = {}
     for point_key in RENJI_ACTIVE_POINTS:
-        for metric in RenjiDataset.ALL_METRICS:
-            query = renji_query(point_key, metric)
-            texts[query] = query
+        query = renji_query(point_key, metric)
+        texts[query] = query
     return texts
 
 
@@ -185,6 +185,7 @@ def build_dataset(data_args: DataArguments, split: str):
             shuffle=(split == "train"),
             max_samples=max_samples,
             target_prediction_points=RENJI_ACTIVE_POINTS,
+            task_name=data_args.task_name,
         )
     if data_args.dataset_name == "pds":
         if data_args.patient_split_path is None or not str(data_args.patient_split_path).strip():
@@ -233,13 +234,16 @@ def main():
     if data_args.dataset_name == "pds" and (data_args.trial_id is None or not str(data_args.trial_id).strip()):
         raise ValueError("--trial_id is required when --dataset_name pds")
 
-    is_multi_query_dataset = data_args.dataset_name == "renji"
-    if is_multi_query_dataset:
-        task_info = get_dataset_task_info(data_args.dataset_name)[data_args.task_name or "candidate_metric_prediction"]
-        query_key = f"{data_args.dataset_name}:{data_args.task_name or 'candidate_metric_prediction'}"
-        query_texts = build_renji_query_texts()
+    if data_args.dataset_name == "renji":
+        if data_args.task_name not in RenjiDataset.ALL_METRICS:
+            raise ValueError(f"--task_name for Renji must be one of {RenjiDataset.ALL_METRICS}; got {data_args.task_name!r}")
+        is_multi_query_dataset = False
+        task_info = get_dataset_task_info(data_args.dataset_name)["single_metric_prediction"]
+        query_key = f"{data_args.dataset_name}:single_metric_prediction:{data_args.task_name}"
+        query_texts = build_renji_query_texts(data_args.task_name)
         label_map = None
     else:
+        is_multi_query_dataset = False
         task_info = get_dataset_task_info(data_args.dataset_name)[data_args.task_name]
         if data_args.dataset_name == "pds":
             task_info = dict(task_info)
@@ -279,7 +283,7 @@ def main():
         knowledge_encoder_path=data_args.knowledge_encoder_path,
         knowledge_encoder_base_model_path=data_args.knowledge_encoder_base_model_path,
     )
-    if not is_multi_query_dataset:
+    if not is_multi_query_dataset and data_args.dataset_name != "renji":
         query_tensor, label_map = build_query_tensor(query_key, task_info, embeddings_by_text)
 
     config = LongTableEncoder1DConfig(
@@ -304,12 +308,15 @@ def main():
             query_embeddings_by_text=embeddings_by_text,
         )
     else:
+        query_tensor_arg = None if data_args.dataset_name == "renji" else query_tensor
+        query_embeddings_by_text_arg = embeddings_by_text if data_args.dataset_name == "renji" else None
         collate_fn = create_query_classifier_collate_fn(
             type_vocab,
             max_table_len=data_args.max_table_len,
             text_to_idx=text_to_idx,
             pad_idx=pad_idx,
-            query_embeds=query_tensor,
+            query_embeds=query_tensor_arg,
+            query_embeddings_by_text=query_embeddings_by_text_arg,
             label_map=label_map,
         )
 

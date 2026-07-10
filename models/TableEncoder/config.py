@@ -24,6 +24,8 @@ class _BaseTableEncoderConfig(PretrainedConfig):
         max_table_len: Optional[int] = 32768,
         # GPT-style table encoding: each row can only attend to current/past rows.
         is_causal: bool = True,
+        # Recompute transformer blocks during backward to reduce activation memory.
+        activation_checkpointing: bool = False,
 
         # Table feature settings for numeric value Fourier features and type embeddings.
         fourier_scales: Optional[List[float]] = None,
@@ -64,6 +66,7 @@ class _BaseTableEncoderConfig(PretrainedConfig):
         self.dim_out = dim_out
         self.max_table_len = max_table_len
         self.is_causal = is_causal
+        self.activation_checkpointing = activation_checkpointing
 
         self.fourier_scales = fourier_scales
         self.type_vocab_size = type_vocab_size

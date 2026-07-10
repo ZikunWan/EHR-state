@@ -13,7 +13,8 @@ from tqdm.auto import tqdm
 
 
 DEFAULT_ROOT_DIR = "/data/zikun_workspace/input/tables/renji/raw"
-DEFAULT_OUTPUT_DIR = "/data/zikun_workspace/input/tasks/time_to_event/renji/indices"
+DEFAULT_SPLIT_JSON_DIR = "/data/zikun_workspace/input/metadata/splits/renji/json"
+DEFAULT_OUTPUT_DIR = "/data/zikun_workspace/input/tasks/time_to_event/renji"
 DEFAULT_DEATH_HORIZON_DAYS = 1825
 TACROLIMUS_EVENT_LABEL_COLUMN = "他克莫司浓度_label"
 TACROLIMUS_STAGE_SPECS = (
@@ -28,6 +29,7 @@ def parse_args() -> argparse.Namespace:
         description="Generate Renji death and tacrolimus TTE index files."
     )
     parser.add_argument("--root-dir", default=DEFAULT_ROOT_DIR)
+    parser.add_argument("--split-json-dir", default=DEFAULT_SPLIT_JSON_DIR)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--death-horizon-days", type=int, default=DEFAULT_DEATH_HORIZON_DAYS)
     parser.add_argument("--val-ratio", type=float, default=0.1)
@@ -146,11 +148,10 @@ def add_validation_split(split_files, val_ratio: float, seed: int):
     return updated
 
 
-def load_json_split_files(root_dir: str):
-    index_dir = os.path.join(root_dir, "index")
+def load_json_split_files(split_json_dir: str):
     split_files = {}
     for split in ("train", "val", "test"):
-        path = os.path.join(index_dir, f"{split}_renji.json")
+        path = os.path.join(split_json_dir, f"{split}_renji.json")
         if not os.path.exists(path):
             continue
         with open(path, "r", encoding="utf-8") as file:
@@ -162,8 +163,8 @@ def load_json_split_files(root_dir: str):
     return split_files
 
 
-def load_split_files(root_dir: str, encoding: str, val_ratio: float, seed: int):
-    split_files = load_json_split_files(root_dir)
+def load_split_files(root_dir: str, split_json_dir: str, encoding: str, val_ratio: float, seed: int):
+    split_files = load_json_split_files(split_json_dir)
     if split_files:
         missing = [split for split in ("train", "val", "test") if split not in split_files]
         if missing:
@@ -389,6 +390,7 @@ def main():
     patient_info_map = build_patient_info_map(args.root_dir, args.encoding)
     split_files = load_split_files(
         args.root_dir,
+        args.split_json_dir,
         args.encoding,
         args.val_ratio,
         args.seed,
@@ -432,7 +434,7 @@ def main():
                 add_skipped(tacrolimus_skipped, skipped)
 
         if "death" in args.tasks:
-            output_path = os.path.join(args.output_dir, f"death_tte_{split}.csv")
+            output_path = os.path.join(args.output_dir, split, "death_survival.csv")
             write_index(output_path, death_rows)
             events = sum(int(row["event_observed"]) for row in death_rows)
             print(
@@ -442,7 +444,7 @@ def main():
             print(f"Saved {output_path}")
 
         if "tacrolimus" in args.tasks:
-            output_path = os.path.join(args.output_dir, f"tacrolimus_tte_{split}.csv")
+            output_path = os.path.join(args.output_dir, split, "tacrolimus_abnormal_survival.csv")
             write_index(output_path, tacrolimus_rows)
             events = sum(int(row["event_observed"]) for row in tacrolimus_rows)
             print(

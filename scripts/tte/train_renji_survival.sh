@@ -8,7 +8,7 @@ deepspeed --include localhost:4,5,6,7 train/tte/train_renji_survival.py \
     --output_dir "/data/zikun_workspace/checkpoints/renji/tacrolimus_survival" \
     --run_name "renji_tacrolimus_abnormal_survival" \
     --patient_subset_path "data/patients.json" \
-    --tte_index_dir "/data/zikun_workspace/input/tasks/time_to_event/renji/indices" \
+    --tte_index_dir "/data/zikun_workspace/input/tasks/time_to_event/renji" \
     --max_table_len 4096 \
     --per_device_train_batch_size 32 \
     --per_device_eval_batch_size 64 \
@@ -30,7 +30,7 @@ deepspeed --include localhost:4,5,6,7 train/tte/train_renji_survival.py \
     --dataloader_num_workers 32 \
     --report_to wandb \
     --query_embedding_cache "/data/zikun_workspace/input/cache/query_embeddings/query_candidate/renji_survival_task_query_knowledge_embeddings.pt" \
-    --knowledge_encoder_path "/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/clinicalBERT_after_stage2/best.pt" \
+    --knowledge_encoder_path "/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/best.pt" \
     --knowledge_encoder_base_model_path "/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT" \
     --query_max_length 128 \
     --pretrained_path "/data/zikun_workspace/checkpoints/pretraining/phenotype_metric_learning"

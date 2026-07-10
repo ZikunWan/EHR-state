@@ -29,7 +29,10 @@ def discover_trials(root_dir):
     return sorted(
         name
         for name in os.listdir(root_dir)
-        if os.path.isdir(os.path.join(root_dir, name, "labels"))
+        if (
+            os.path.isdir(os.path.join(root_dir, name, "labels"))
+            or os.path.isfile(os.path.join(root_dir, name, TASK_LABEL_FILES["severe_outcome"]))
+        )
     )
 
 
@@ -41,6 +44,26 @@ def read_patient_label_counts(label_path):
             patient_id = normalize_patient_id(row["patient_id"])
             patient_label_counts[patient_id][int(row["label"])] += 1
     return dict(patient_label_counts)
+
+
+def task_label_path(label_root_dir, trial_id, label_file):
+    candidates = [
+        os.path.join(label_root_dir, trial_id, label_file),
+        os.path.join(label_root_dir, trial_id, "labels", label_file),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
+def merge_patient_label_counts(left, right):
+    merged = defaultdict(lambda: {0: 0, 1: 0})
+    for source in (left, right):
+        for patient_id, counts in source.items():
+            merged[patient_id][0] += counts[0]
+            merged[patient_id][1] += counts[1]
+    return dict(merged)
 
 
 def split_trial_patients(patient_label_counts, seed, ratios, num_attempts=20, local_search_swaps=2000):
@@ -206,7 +229,22 @@ def split_ratio_score(current_counts, patient_counts, target_counts):
 def main():
     parser = argparse.ArgumentParser(description="Generate PDS patient-level train/val/test splits.")
     parser.add_argument("--root_dir", required=True)
+    parser.add_argument(
+        "--label_root_dir",
+        default=None,
+        help="Directory containing <trial_id>/labels. Defaults to --root_dir.",
+    )
     parser.add_argument("--output_path", required=True)
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        help="Optional directory for trial-level CSV splits: <trial_id>/{train,val,test}.csv.",
+    )
+    parser.add_argument(
+        "--output_index_dir",
+        default=None,
+        help="Optional directory for split task indices: <trial_id>/<split>/<task>.csv.",
+    )
     parser.add_argument("--trial_ids", default=None, help="Comma-separated trial IDs. Defaults to all trials.")
     parser.add_argument(
         "--tasks",
@@ -220,41 +258,94 @@ def main():
     parser.add_argument("--local_search_swaps", type=int, default=2000)
     args = parser.parse_args()
 
-    trial_ids = parse_csv_list(args.trial_ids) or discover_trials(args.root_dir)
+    label_root_dir = args.label_root_dir or args.root_dir
+    trial_ids = parse_csv_list(args.trial_ids) or discover_trials(label_root_dir)
     tasks = parse_csv_list(args.tasks)
     ratios = (args.train_ratio, args.val_ratio, 1.0 - args.train_ratio - args.val_ratio)
     if ratios[0] <= 0 or ratios[1] <= 0 or ratios[2] <= 0:
         raise ValueError("train/val/test ratios must all be positive.")
 
     output = {}
-    for task_name in tasks:
-        label_file = TASK_LABEL_FILES[task_name]
-        output[task_name] = {}
-        for trial_id in trial_ids:
-            label_path = os.path.join(args.root_dir, trial_id, "labels", label_file)
+    for trial_id in trial_ids:
+        trial_label_counts = {}
+        included_tasks = []
+        for task_name in tasks:
+            label_file = TASK_LABEL_FILES[task_name]
+            label_path = task_label_path(label_root_dir, trial_id, label_file)
             if not os.path.exists(label_path):
                 continue
 
-            patient_label_counts = read_patient_label_counts(label_path)
-            split_patients, split_label_counts = split_trial_patients(
-                patient_label_counts,
-                seed=f"{args.seed}:{task_name}:{trial_id}",
-                ratios=ratios,
-                num_attempts=args.num_attempts,
-                local_search_swaps=args.local_search_swaps,
+            trial_label_counts = merge_patient_label_counts(
+                trial_label_counts,
+                read_patient_label_counts(label_path),
             )
-            output[task_name][trial_id] = split_patients
-            counts_text = " ".join(
-                f"{split}=patients:{len(split_patients[split])},labels:{split_label_counts[split]}"
-                for split in ("train", "val", "test")
-            )
-            print(f"{task_name} trial {trial_id}: {counts_text}")
+            included_tasks.append(task_name)
+
+        if not trial_label_counts:
+            continue
+
+        split_patients, split_label_counts = split_trial_patients(
+            trial_label_counts,
+            seed=f"{args.seed}:{trial_id}:{','.join(included_tasks)}",
+            ratios=ratios,
+            num_attempts=args.num_attempts,
+            local_search_swaps=args.local_search_swaps,
+        )
+        output[trial_id] = split_patients
+        counts_text = " ".join(
+            f"{split}=patients:{len(split_patients[split])},labels:{split_label_counts[split]}"
+            for split in ("train", "val", "test")
+        )
+        print(f"trial {trial_id}: tasks:{','.join(included_tasks)} {counts_text}")
 
     output_dir = os.path.dirname(args.output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
     with open(args.output_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
+
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        for trial_id, split_patients in output.items():
+            trial_dir = os.path.join(args.output_dir, str(trial_id))
+            os.makedirs(trial_dir, exist_ok=True)
+            for split in ("train", "val", "test"):
+                csv_path = os.path.join(trial_dir, f"{split}.csv")
+                with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["patient_id"])
+                    writer.writerows([patient_id] for patient_id in split_patients[split])
+
+    if args.output_index_dir:
+        os.makedirs(args.output_index_dir, exist_ok=True)
+        for trial_id, split_patients in output.items():
+            for task_name in tasks:
+                label_file = TASK_LABEL_FILES[task_name]
+                label_path = task_label_path(label_root_dir, trial_id, label_file)
+                if not os.path.exists(label_path):
+                    continue
+                split_patient_sets = {
+                    split: set(split_patients[split])
+                    for split in ("train", "val", "test")
+                }
+                rows_by_split = {split: [] for split in ("train", "val", "test")}
+                with open(label_path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    fieldnames = reader.fieldnames
+                    for row in reader:
+                        patient_id = normalize_patient_id(row["patient_id"])
+                        for split, patient_ids in split_patient_sets.items():
+                            if patient_id in patient_ids:
+                                rows_by_split[split].append(row)
+                                break
+                for split, rows in rows_by_split.items():
+                    split_dir = os.path.join(args.output_index_dir, trial_id, split)
+                    os.makedirs(split_dir, exist_ok=True)
+                    split_path = os.path.join(split_dir, label_file)
+                    with open(split_path, "w", encoding="utf-8", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(rows)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ Examples:
         --dataset ehrshot \
         --root_dir /data/zikun_workspace/input/tables/ehrshot \
         --ehrshot_index_dir /data/zikun_workspace/input/tasks/classification/ehrshot/indices \
-        --output_dir /data/zikun_workspace/input/tables/ehrshot/pretraining_index
+        --output_dir /data/zikun_workspace/input/tasks/pretraining/ehrshot/indices
 """
 
 import argparse

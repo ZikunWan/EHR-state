@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="/data/zikun_workspace/mimic-iv-3.1_tabular"
-INDEX_DIR="/data/zikun_workspace/input/tasks/classification/mimic_iv/index"
+INDEX_DIR="/data/zikun_workspace/input/tasks/classification/mimic_iv/indices"
 TTE_INDEX_DIR="/data/zikun_workspace/input/tasks/time_to_event/mimic_iv/indices"
 TASKS="ED_Hospitalization,ED_Inpatient_Mortality,ED_ICU_Tranfer_12hour,ED_Reattendance_3day,ED_Critical_Outcomes,Readmission_30day,Readmission_60day,Inpatient_Mortality,LengthOfStay_3day,LengthOfStay_7day,ICU_Mortality_1day,ICU_Mortality_2day,ICU_Mortality_3day,ICU_Mortality_7day,ICU_Mortality_14day,ICU_Stay_7day,ICU_Stay_14day,ICU_Readmission,next_token_prediction"
 

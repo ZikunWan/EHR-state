@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .attention import StandardTransformerLayer
 from .config import LongTableEncoder1DConfig, _BaseTableEncoderConfig
@@ -105,6 +106,19 @@ class LongTableEncoder1D(_BaseTableEncoder):
         )
 
         for layer in self.layers:
-            output_features = layer(output_features, seq_mask, causal=self.config.is_causal)
+            if self.training and self.config.activation_checkpointing:
+                output_features = checkpoint(
+                    layer,
+                    output_features,
+                    seq_mask,
+                    causal=self.config.is_causal,
+                    use_reentrant=False,
+                )
+            else:
+                output_features = layer(
+                    output_features,
+                    seq_mask,
+                    causal=self.config.is_causal,
+                )
 
         return self._format_output(output_features, seq_mask, return_mask)

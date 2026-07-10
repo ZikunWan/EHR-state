@@ -46,6 +46,7 @@ class PDSDataset(Dataset):
         self.random_seed = random_seed
         self.task_schema = get_task_info()
         self.measurement_cache_dir = os.path.join(self.root_dir, "cache", "measurement_table")
+        self.label_root_dir = "/data/zikun_workspace/input/tasks/classification/PDS"
 
         if self.task_name not in self.TASK_LABEL_FILES:
             raise ValueError(
@@ -75,7 +76,7 @@ class PDSDataset(Dataset):
         for trial_id in self.trial_ids:
             trial_dir = os.path.join(self.root_dir, str(trial_id))
             patients_dir = os.path.join(trial_dir, "patients")
-            labels_dir = os.path.join(trial_dir, "labels")
+            labels_dir = self._labels_dir(trial_id)
 
             label_file = self.TASK_LABEL_FILES[self.task_name]
             labels_df = pd.read_csv(
@@ -101,6 +102,18 @@ class PDSDataset(Dataset):
 
         return samples
 
+    def _labels_dir(self, trial_id):
+        task_labels_dir = os.path.join(self.label_root_dir, str(trial_id), self.split)
+        if os.path.isdir(task_labels_dir):
+            return task_labels_dir
+        task_labels_dir = os.path.join(self.label_root_dir, str(trial_id))
+        if os.path.isdir(task_labels_dir):
+            return task_labels_dir
+        task_labels_dir = os.path.join(self.label_root_dir, str(trial_id), "labels")
+        if os.path.isdir(task_labels_dir):
+            return task_labels_dir
+        return os.path.join(self.root_dir, str(trial_id), "labels")
+
     def _apply_split(self, samples):
         split = str(self.split)
         if split not in {"train", "val", "test"}:
@@ -108,13 +121,18 @@ class PDSDataset(Dataset):
 
         allowed = set()
         for trial_id in self.trial_ids:
-            split_patient_ids = self.patient_splits[self.task_name][trial_id][split]
+            split_patient_ids = self._split_patient_ids(trial_id, split)
             allowed.update((trial_id, patient_id) for patient_id in split_patient_ids)
 
         return [
             sample for sample in samples
             if (sample["trial_id"], sample["patient_id"]) in allowed
         ]
+
+    def _split_patient_ids(self, trial_id, split):
+        if trial_id in self.patient_splits:
+            return self.patient_splits[trial_id][split]
+        return self.patient_splits[self.task_name][trial_id][split]
 
     def _apply_patient_limit(self, samples):
         if self.max_patients is None:

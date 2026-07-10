@@ -31,7 +31,7 @@ class MIMICIVCDM(Dataset):
         random.seed(42)
 
         self.root_dir = root_dir
-        self.index_dir = index_dir or os.path.join(self.root_dir, "index")
+        self.index_dir = index_dir or "/data/zikun_workspace/input/tasks/classification/mimic_iv_cdm"
         self.split = split
         self.lazy_mode = lazy_mode
         self.task_schema = get_task_info()
@@ -77,13 +77,17 @@ class MIMICIVCDM(Dataset):
         index_path = os.path.join(self.index_dir, f"mimiciv_cdm_{self.split}.csv")
         self.list_data = pd.read_csv(index_path).to_dict(orient="records")
 
+    @staticmethod
+    def _sample_label(sample):
+        return sample.get("label", sample.get("category"))
+
     def _balance_samples(self, all_samples, max_samples):
         if max_samples is None or max_samples >= len(all_samples):
             return all_samples
 
         label_groups = defaultdict(list)
         for sample in all_samples:
-            label = str(sample['category']).lower()
+            label = str(self._sample_label(sample)).lower()
             label_groups[label].append(sample)
 
         sorted_labels = sorted(label_groups.keys(), key=lambda k: len(label_groups[k]))
@@ -213,7 +217,7 @@ class MIMICIVCDM(Dataset):
 
     def _process_item(self, index):
         index_item = self.list_data[index]
-        category = index_item["category"]
+        category = self._sample_label(index_item)
         hadm_id = index_item["hadm_id"]
         cur_item = self.raw_data[category][hadm_id]
 

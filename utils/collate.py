@@ -457,6 +457,7 @@ def create_query_classifier_collate_fn(
     text_to_idx: Optional[Dict[str, int]] = None,
     pad_idx: int = 0,
     query_embeds: Optional[torch.Tensor] = None,
+    query_embeddings_by_text: Optional[Dict[str, torch.Tensor]] = None,
     label_map: Optional[Dict[str, int]] = None,
 ):
     if type_vocab is None:
@@ -473,12 +474,15 @@ def create_query_classifier_collate_fn(
 
         tables = []
         labels = []
+        sample_query_embeds = []
         for sample in batch:
             table = sample["measurement_table"]
             if max_table_len is not None:
                 table = table.tail(max_table_len).reset_index(drop=True)
             tables.append(table)
             labels.append(parse_classification_label(sample["output"], label_map=label_map))
+            if query_embeddings_by_text is not None:
+                sample_query_embeds.append(query_embeddings_by_text[str(sample["instruction"])].float())
 
         tensors = build_table_token_tensors(
             tables,
@@ -487,12 +491,15 @@ def create_query_classifier_collate_fn(
             type_vocab=type_vocab,
         )
         batch_size = len(tables)
-        query_tensor = query_embeds.float()
-        if query_tensor.dim() == 1:
-            tensors["query_embeds"] = query_tensor.unsqueeze(0).expand(batch_size, -1).clone()
+        if query_embeddings_by_text is not None:
+            tensors["query_embeds"] = torch.stack(sample_query_embeds)
         else:
-            tensors["query_embeds"] = query_tensor.unsqueeze(0).expand(batch_size, -1, -1).clone()
-            tensors["query_mask"] = torch.ones(batch_size, query_tensor.size(0), dtype=torch.float32)
+            query_tensor = query_embeds.float()
+            if query_tensor.dim() == 1:
+                tensors["query_embeds"] = query_tensor.unsqueeze(0).expand(batch_size, -1).clone()
+            else:
+                tensors["query_embeds"] = query_tensor.unsqueeze(0).expand(batch_size, -1, -1).clone()
+                tensors["query_mask"] = torch.ones(batch_size, query_tensor.size(0), dtype=torch.float32)
         tensors["labels"] = torch.tensor(labels, dtype=torch.long)
         return tensors
 

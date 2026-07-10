@@ -2,6 +2,7 @@ import bisect
 import json
 import math
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -11,6 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from accelerate.utils import DistributedType
 from tqdm.auto import tqdm
 from transformers import (
     EarlyStoppingCallback,
@@ -21,6 +23,7 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from transformers.trainer_pt_utils import LengthGroupedSampler
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -149,6 +152,11 @@ class PretrainingArguments(TrainingArguments):
     relation_l2_weight: float = field(default=0.0)
     min_pair_delta: float = field(default=0.0)
     min_lr_ratio: float = field(default=0.1)
+    activation_checkpointing: bool = field(default=False)
+    grad_cache: bool = field(default=False)
+    grad_cache_micro_batch_size: int = field(default=8)
+    length_grouped_batching: bool = field(default=False)
+    text_embedding_on_gpu: bool = field(default=False)
 
     def __post_init__(self):
         super().__post_init__()
@@ -176,6 +184,12 @@ class PretrainingArguments(TrainingArguments):
             )
         if self.min_pair_delta < 0:
             raise ValueError("Minimum pair delta must be non-negative.")
+        if self.grad_cache_micro_batch_size <= 0:
+            raise ValueError("GradCache micro batch size must be positive.")
+        if self.grad_cache and self.gradient_accumulation_steps != 1:
+            raise ValueError(
+                "GradCache currently requires gradient_accumulation_steps=1."
+            )
         if self.wandb_project:
             os.environ["WANDB_PROJECT"] = self.wandb_project
         eval_strategy = str(self.eval_strategy).lower()
@@ -208,6 +222,8 @@ class PreprocessedPretrainingTaskDataset(torch.utils.data.Dataset):
         task_query_embeddings: Dict[str, torch.Tensor],
         phenotype_specs: List[pml.PhenotypeQuerySpec],
         text_to_idx: Dict[str, int],
+        max_table_len: Optional[int] = None,
+        build_lengths: bool = False,
     ):
         self.split_dir = os.path.join(cache_root, split)
         manifest_path = os.path.join(self.split_dir, "manifest.json")
@@ -251,7 +267,10 @@ class PreprocessedPretrainingTaskDataset(torch.utils.data.Dataset):
         self.num_phenotypes = len(phenotype_specs)
         if int(self.manifest.get("num_phenotypes", -1)) != self.num_phenotypes:
             raise ValueError(f"Phenotype count mismatch in {manifest_path}.")
-        self.max_tte_bins = int(self.manifest.get("max_tte_bins", 0))
+        self.max_tte_bins = int(
+            self.manifest.get("max_tte_bins", self.manifest.get("365", 0))
+        )
+        self.max_table_len = max_table_len
 
         self._open_parts = {}
         if self.format_version >= 4:
@@ -259,6 +278,7 @@ class PreprocessedPretrainingTaskDataset(torch.utils.data.Dataset):
             self.supervision = dict(self.manifest.get("supervision", {}))
             self.sample_count = int(self.supervision.get("sample_count", 0))
             supervision_dir = os.path.join(self.split_dir, self.supervision["path"])
+            self.supervision_dir = supervision_dir
             self.supervision_arrays = {
                 "input_part_ids": np.memmap(
                     os.path.join(supervision_dir, "input_part_ids.bin"),
@@ -322,16 +342,97 @@ class PreprocessedPretrainingTaskDataset(torch.utils.data.Dataset):
         if self.sample_count == 0:
             raise ValueError(f"EHR encoder pretraining {split} cache contains no samples.")
         if self.format_version >= 4:
-            print(
+            pml.rank0_print(
                 f"Loaded EHR encoder pretraining {split} cache: "
                 f"{self.sample_count} samples over "
                 f"{len(self.input_parts)} shared input parts"
             )
         else:
-            print(
+            pml.rank0_print(
                 f"Loaded EHR encoder pretraining {split} cache: "
                 f"{self.sample_count} samples across {len(self.parts)} parts"
             )
+        self.lengths = self._load_or_build_lengths() if build_lengths else None
+
+    def _load_or_build_lengths(self):
+        if self.format_version < 4:
+            raise ValueError("Length-grouped batching requires cache format >= 4.")
+        lengths_path = os.path.join(self.supervision_dir, "sequence_lengths.bin")
+        expected_bytes = self.sample_count * np.dtype(np.int32).itemsize
+
+        def build_if_needed():
+            if not os.path.exists(lengths_path) or os.path.getsize(lengths_path) != expected_bytes:
+                pml.rank0_print(
+                    f"Building sequence-length index for {self.sample_count} samples...",
+                    flush=True,
+                )
+                local_tmp_path = os.path.join(
+                    "/tmp", f"structehr_sequence_lengths.{os.getpid()}.bin"
+                )
+                remote_tmp_path = f"{lengths_path}.tmp.{os.getpid()}"
+                lengths = np.memmap(
+                    local_tmp_path,
+                    dtype=np.int32,
+                    mode="w+",
+                    shape=(self.sample_count,),
+                )
+                offsets_by_part = {
+                    part_idx: np.load(
+                        os.path.join(self.split_dir, part["path"], "offsets.npy")
+                    )
+                    for part_idx, part in enumerate(self.input_parts)
+                }
+                part_ids = self.supervision_arrays["input_part_ids"]
+                local_ids = self.supervision_arrays["input_local_ids"]
+                chunk_size = 1_000_000
+                for chunk_start in range(0, self.sample_count, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, self.sample_count)
+                    chunk_part_ids = np.asarray(
+                        part_ids[chunk_start:chunk_end]
+                    )
+                    chunk_local_ids = np.asarray(
+                        local_ids[chunk_start:chunk_end]
+                    )
+                    order = np.argsort(chunk_part_ids, kind="stable")
+                    sorted_part_ids = chunk_part_ids[order]
+                    chunk_lengths = np.empty(
+                        chunk_end - chunk_start, dtype=np.int32
+                    )
+                    unique_parts, starts = np.unique(
+                        sorted_part_ids, return_index=True
+                    )
+                    ends = np.append(starts[1:], len(order))
+                    for part_idx, start, end in zip(unique_parts, starts, ends):
+                        positions = order[start:end]
+                        sample_ids = chunk_local_ids[positions]
+                        offsets = offsets_by_part[int(part_idx)]
+                        chunk_lengths[positions] = (
+                            offsets[sample_ids + 1] - offsets[sample_ids]
+                        ).astype(np.int32)
+                    lengths[chunk_start:chunk_end] = chunk_lengths
+                lengths.flush()
+                del lengths
+                shutil.copyfile(local_tmp_path, remote_tmp_path)
+                os.replace(remote_tmp_path, lengths_path)
+                os.remove(local_tmp_path)
+                pml.rank0_print("Sequence-length index ready.", flush=True)
+
+        if pml.is_distributed():
+            if pml.is_rank0():
+                build_if_needed()
+            dist.barrier()
+        else:
+            build_if_needed()
+
+        lengths = np.memmap(
+            lengths_path,
+            dtype=np.int32,
+            mode="r",
+            shape=(self.sample_count,),
+        )
+        if self.max_table_len is not None:
+            return np.minimum(lengths, int(self.max_table_len))
+        return lengths
 
     def __len__(self):
         return self.sample_count
@@ -623,7 +724,21 @@ class JointPretrainingModel(PreTrainedModel):
 
         self.encoder = LongTableEncoder1D(config)
         self.adapter = QFormerAdapter(config)
-        self.text_embedding_matrix = embedding_matrix.cpu()
+        if training_args.text_embedding_on_gpu:
+            embedding_dtype = (
+                torch.bfloat16
+                if training_args.bf16
+                else torch.float16
+                if training_args.fp16
+                else torch.float32
+            )
+            self.register_buffer(
+                "text_embedding_matrix",
+                embedding_matrix.to(dtype=embedding_dtype),
+                persistent=False,
+            )
+        else:
+            self.text_embedding_matrix = embedding_matrix.cpu()
         self.ntp_head = NextTokenPredictionDecoder(
             hidden_dim=config.dim,
             text_dim=config.text_dim,
@@ -668,10 +783,15 @@ class JointPretrainingModel(PreTrainedModel):
         self.post_init()
 
     def text_lookup(self, token_ids, dtype, device):
-        flat = self.text_embedding_matrix.index_select(
-            0, token_ids.reshape(-1).cpu()
-        )
-        flat = flat.to(device=device, dtype=dtype, non_blocking=True)
+        if self.text_embedding_matrix.device.type == "cpu":
+            flat = self.text_embedding_matrix.index_select(
+                0, token_ids.reshape(-1).cpu()
+            )
+            flat = flat.to(device=device, dtype=dtype, non_blocking=True)
+        else:
+            flat = self.text_embedding_matrix.index_select(
+                0, token_ids.reshape(-1).to(self.text_embedding_matrix.device)
+            ).to(dtype=dtype)
         return flat.view(*token_ids.shape, flat.size(-1))
 
     def encode_rows(self, inputs):
@@ -870,9 +990,27 @@ class JointPretrainingModel(PreTrainedModel):
             dtype=hidden_mask.dtype,
             device=hidden_mask.device,
         )
-        local_embeddings = F.normalize(
-            self.metric_pooling(adapted, pooled_mask), dim=-1
+        local_embeddings = self.metric_embeddings(adapted, pooled_mask)
+        return self.forward_metric_from_embeddings(
+            local_embeddings, phenotype_values, phenotype_mask
         )
+
+    def metric_embeddings(self, adapted, pooled_mask):
+        return F.normalize(self.metric_pooling(adapted, pooled_mask), dim=-1)
+
+    def forward_metric_embeddings(self, inputs):
+        hidden_states, hidden_mask, _, _, _ = self.encode_rows(inputs)
+        adapted = self.adapter(hidden_states, hidden_mask)
+        pooled_mask = torch.ones(
+            adapted.shape[:2],
+            dtype=hidden_mask.dtype,
+            device=hidden_mask.device,
+        )
+        return self.metric_embeddings(adapted, pooled_mask)
+
+    def forward_metric_from_embeddings(
+        self, local_embeddings, phenotype_values, phenotype_mask
+    ):
         global_embeddings = pml.all_gather_with_grad(local_embeddings)
         global_values = pml.all_gather_tensor(
             phenotype_values.to(
@@ -993,6 +1131,34 @@ class JointPretrainingModel(PreTrainedModel):
             "metric_output": metric_output,
         }
 
+    def forward_joint_grad_cache(self, inputs):
+        hidden_states, hidden_mask, item_emb, unit_emb, value_emb = self.encode_rows(
+            inputs
+        )
+        ntp_output = self.ntp_head(
+            hidden_states=hidden_states,
+            attention_mask=hidden_mask,
+            target_item_emb=item_emb,
+            target_unit_emb=unit_emb,
+            target_value_text_emb=value_emb,
+            target_numeric_values=inputs["numeric_values"],
+            target_numeric_mask=inputs["numeric_mask"],
+            target_type_ids=inputs["type_ids"],
+            target_times=inputs["times"],
+        )
+        adapted = self.adapter(hidden_states, hidden_mask)
+        task_output = self.forward_task_from_adapted(adapted, inputs)
+        pooled_mask = torch.ones(
+            adapted.shape[:2],
+            dtype=hidden_mask.dtype,
+            device=hidden_mask.device,
+        )
+        return {
+            "ntp_output": ntp_output,
+            "task_output": task_output,
+            "metric_embeddings": self.metric_embeddings(adapted, pooled_mask),
+        }
+
     def forward(
         self,
         objective: str,
@@ -1005,8 +1171,18 @@ class JointPretrainingModel(PreTrainedModel):
             return self.forward_task(inputs)
         if objective == "metric":
             return self.forward_metric(inputs)
+        if objective == "metric_embeddings":
+            return self.forward_metric_embeddings(inputs)
+        if objective == "metric_from_embeddings":
+            return self.forward_metric_from_embeddings(
+                inputs["embeddings"],
+                inputs["phenotype_values"],
+                inputs["phenotype_mask"],
+            )
         if objective == "joint":
             return self.forward_joint(inputs)
+        if objective == "joint_grad_cache":
+            return self.forward_joint_grad_cache(inputs)
         if objective == "combine":
             total, weighted_losses = self.loss_combiner(losses)
             return {
@@ -1029,6 +1205,24 @@ class JointPretrainingTrainer(Trainer):
             "metric_loss": 0.0,
         }
         self._component_count = 0
+
+    def _get_train_sampler(self, train_dataset=None):
+        train_dataset = self.train_dataset if train_dataset is None else train_dataset
+        if not self.args.length_grouped_batching:
+            return super()._get_train_sampler(train_dataset)
+        if train_dataset is None or train_dataset.lengths is None:
+            raise ValueError(
+                "Length-grouped batching requires precomputed dataset lengths."
+            )
+        generator = torch.Generator()
+        generator.manual_seed(
+            self.args.data_seed if self.args.data_seed is not None else self.args.seed
+        )
+        return LengthGroupedSampler(
+            self.args.train_batch_size * self.args.gradient_accumulation_steps,
+            lengths=train_dataset.lengths,
+            generator=generator,
+        )
 
     def create_scheduler(
         self, num_training_steps: int, optimizer=None
@@ -1063,9 +1257,20 @@ class JointPretrainingTrainer(Trainer):
             combined["metric_output"],
         )
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        outputs = self._forward_objectives(model, inputs)
-        combined, ntp_output, task_output, metric_output = outputs
+    @staticmethod
+    def _slice_batch(inputs, start, end, batch_size):
+        return {
+            key: (
+                value[start:end]
+                if torch.is_tensor(value)
+                and value.ndim > 0
+                and value.size(0) == batch_size
+                else value
+            )
+            for key, value in inputs.items()
+        }
+
+    def _record_components(self, ntp_output, task_output, metric_loss):
         self._component_sums["ntp_loss"] += ntp_output.loss.detach().float().item()
         self._component_sums["ntp_time_loss"] += (
             ntp_output.time_loss.detach().float().item()
@@ -1082,9 +1287,136 @@ class JointPretrainingTrainer(Trainer):
         self._component_sums["task_multiclass_loss"] += (
             task_output["multiclass_loss"].detach().float().item()
         )
+        self._component_sums["metric_loss"] += metric_loss.detach().float().item()
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        if not self.args.grad_cache:
+            return super().training_step(model, inputs, num_items_in_batch)
+
+        model.train()
+        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+            self.optimizer.train()
+        inputs = self._prepare_inputs(inputs)
+        batch_size = int(inputs["item_ids"].size(0))
+        micro_batch_size = min(
+            int(self.args.grad_cache_micro_batch_size), batch_size
+        )
+        chunks = [
+            (start, min(start + micro_batch_size, batch_size))
+            for start in range(0, batch_size, micro_batch_size)
+        ]
+
+        cached_embeddings = []
+        with torch.no_grad():
+            for start, end in chunks:
+                chunk = self._slice_batch(inputs, start, end, batch_size)
+                with self.compute_loss_context_manager():
+                    embeddings = model(
+                        objective="metric_embeddings", inputs=chunk
+                    )
+                cached_embeddings.append(embeddings.detach())
+
+        cached_embeddings = torch.cat(cached_embeddings, dim=0).requires_grad_(True)
+        with self.compute_loss_context_manager():
+            metric_output = model(
+                objective="metric_from_embeddings",
+                inputs={
+                    "embeddings": cached_embeddings,
+                    "phenotype_values": inputs["phenotype_values"],
+                    "phenotype_mask": inputs["phenotype_mask"],
+                },
+            )
+            metric_loss = self.args.metric_loss_weight * metric_output["loss"]
+
+        using_deepspeed = (
+            self.accelerator.distributed_type == DistributedType.DEEPSPEED
+        )
+
+        def backward(loss, final=False):
+            if using_deepspeed and not final:
+                model.set_gradient_accumulation_boundary(is_boundary=False)
+                model.backward(loss, scale_wrt_gas=False)
+            else:
+                kwargs = {"scale_wrt_gas": False} if using_deepspeed else {}
+                self.accelerator.backward(loss, **kwargs)
+
+        backward(metric_loss)
+        embedding_grads = cached_embeddings.grad.detach()
+
+        ntp_total = metric_loss.new_zeros(())
+        task_total = metric_loss.new_zeros(())
+        component_totals = {
+            name: metric_loss.new_zeros(())
+            for name in (
+                "ntp_time_loss",
+                "task_binary_loss",
+                "task_tte_loss",
+                "task_multiclass_loss",
+            )
+        }
+        for chunk_idx, (start, end) in enumerate(chunks):
+            chunk = self._slice_batch(inputs, start, end, batch_size)
+            fraction = float(end - start) / float(batch_size)
+            with self.compute_loss_context_manager():
+                outputs = model(objective="joint_grad_cache", inputs=chunk)
+                ntp_output = outputs["ntp_output"]
+                task_output = outputs["task_output"]
+                ntp_loss = fraction * ntp_output.loss
+                task_loss = fraction * task_output["loss"]
+                proxy_loss = (
+                    outputs["metric_embeddings"] * embedding_grads[start:end]
+                ).sum()
+                chunk_loss = (
+                    self.args.ntp_loss_weight * ntp_loss
+                    + self.args.task_loss_weight * task_loss
+                    + proxy_loss
+                )
+            backward(chunk_loss, final=chunk_idx == len(chunks) - 1)
+            ntp_total = ntp_total + ntp_loss.detach()
+            task_total = task_total + task_loss.detach()
+            component_totals["ntp_time_loss"] += (
+                fraction * ntp_output.time_loss.detach()
+            )
+            component_totals["task_binary_loss"] += (
+                fraction * task_output["binary_loss"].detach()
+            )
+            component_totals["task_tte_loss"] += (
+                fraction * task_output["tte_loss"].detach()
+            )
+            component_totals["task_multiclass_loss"] += (
+                fraction * task_output["multiclass_loss"].detach()
+            )
+
+        self._component_sums["ntp_loss"] += ntp_total.float().item()
+        self._component_sums["ntp_time_loss"] += component_totals[
+            "ntp_time_loss"
+        ].float().item()
+        self._component_sums["task_loss"] += task_total.float().item()
+        self._component_sums["task_binary_loss"] += component_totals[
+            "task_binary_loss"
+        ].float().item()
+        self._component_sums["task_tte_loss"] += component_totals[
+            "task_tte_loss"
+        ].float().item()
+        self._component_sums["task_multiclass_loss"] += component_totals[
+            "task_multiclass_loss"
+        ].float().item()
         self._component_sums["metric_loss"] += (
             metric_output["loss"].detach().float().item()
         )
+        self._component_count += 1
+
+        total_loss = (
+            self.args.ntp_loss_weight * ntp_total
+            + self.args.task_loss_weight * task_total
+            + metric_loss.detach()
+        )
+        return total_loss.detach()
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        outputs = self._forward_objectives(model, inputs)
+        combined, ntp_output, task_output, metric_output = outputs
+        self._record_components(ntp_output, task_output, metric_output["loss"])
         self._component_count += 1
         return (combined["loss"], combined) if return_outputs else combined["loss"]
 
@@ -1322,8 +1654,7 @@ def main():
         embedding_cache_paths(data_args),
         merged_cache_path=data_args.merged_table_embedding_cache,
     )
-    if pml.local_rank0():
-        print("Table embeddings ready.", flush=True)
+    pml.rank0_print("Table embeddings ready.", flush=True)
     type_vocab = pml.load_type_vocab(data_args.type_vocab_file)
     task_names, content_task_names = load_cached_query_names(
         pretraining_input_dir
@@ -1345,8 +1676,10 @@ def main():
             continue
         task_query_texts.update(tqc.build_class_query_texts(task_name, info))
     task_query_texts.update(FORMAT_QUERY_TEXTS)
-    if pml.local_rank0():
-        print(f"Loading task query embeddings: {len(task_query_texts)} texts.", flush=True)
+    pml.rank0_print(
+        f"Loading task query embeddings: {len(task_query_texts)} texts.",
+        flush=True,
+    )
     task_query_embeddings = pml.build_knowledge_query_embeddings(
         query_texts=task_query_texts,
         cache_path=data_args.task_query_embedding_cache,
@@ -1355,15 +1688,16 @@ def main():
         max_length=data_args.query_max_length,
         batch_size=data_args.query_embedding_batch_size,
     )
-    if pml.local_rank0():
-        print("Task query embeddings ready.", flush=True)
+    pml.rank0_print("Task query embeddings ready.", flush=True)
 
     phenotype_specs = pml.load_query_specs(data_args.phenotype_spec_path)
     phenotype_query_texts = {
         spec.key: spec.query_text for spec in phenotype_specs
     }
-    if pml.local_rank0():
-        print(f"Loading phenotype query embeddings: {len(phenotype_query_texts)} texts.", flush=True)
+    pml.rank0_print(
+        f"Loading phenotype query embeddings: {len(phenotype_query_texts)} texts.",
+        flush=True,
+    )
     phenotype_query_embeddings = pml.build_knowledge_query_embeddings(
         query_texts=phenotype_query_texts,
         cache_path=data_args.phenotype_query_embedding_cache,
@@ -1372,8 +1706,7 @@ def main():
         max_length=data_args.query_max_length,
         batch_size=data_args.query_embedding_batch_size,
     )
-    if pml.local_rank0():
-        print("Phenotype query embeddings ready.", flush=True)
+    pml.rank0_print("Phenotype query embeddings ready.", flush=True)
     phenotype_query_embedding_matrix = torch.stack(
         [phenotype_query_embeddings[spec.key] for spec in phenotype_specs],
         dim=0,
@@ -1408,6 +1741,7 @@ def main():
         type_vocab_size=max(type_vocab.values()) + 1,
         max_table_len=data_args.max_table_len,
         dim_out=task_query_dim,
+        activation_checkpointing=training_args.activation_checkpointing,
     )
     model = JointPretrainingModel(
         config=config,
@@ -1424,6 +1758,8 @@ def main():
         task_query_embeddings=task_query_embeddings,
         phenotype_specs=phenotype_specs,
         text_to_idx=text_to_idx,
+        max_table_len=data_args.max_table_len,
+        build_lengths=training_args.length_grouped_batching,
     )
     eval_dataset = PreprocessedPretrainingTaskDataset(
         cache_root=pretraining_input_dir,
@@ -1431,6 +1767,7 @@ def main():
         task_query_embeddings=task_query_embeddings,
         phenotype_specs=phenotype_specs,
         text_to_idx=text_to_idx,
+        max_table_len=data_args.max_table_len,
     )
     collator = PreprocessedUnifiedTaskCollator(
         task_query_embeddings=task_query_embeddings,
@@ -1442,10 +1779,19 @@ def main():
         min_table_rows=data_args.min_table_rows,
     )
 
-    print(f"Unified cached train/val: {len(train_dataset)}/{len(eval_dataset)}")
-    print(f"Task queries: instructions={len(task_names)}, content={len(content_task_names)}, formats=3")
-    print(f"Knowledge query dimension: {task_query_dim}")
-    print(f"Phenotype metric queries: {len(phenotype_specs)}")
+    pml.rank0_print(
+        f"Unified cached train/val: {len(train_dataset)}/{len(eval_dataset)}"
+    )
+    pml.rank0_print(
+        f"Task queries: instructions={len(task_names)}, "
+        f"content={len(content_task_names)}, formats=3"
+    )
+    pml.rank0_print(f"Knowledge query dimension: {task_query_dim}")
+    pml.rank0_print(f"Phenotype metric queries: {len(phenotype_specs)}")
+    if training_args.length_grouped_batching:
+        pml.rank0_print("Length-grouped distributed batching enabled.")
+    if training_args.text_embedding_on_gpu:
+        pml.rank0_print("BF16 text embedding matrix will reside on each GPU.")
 
     eval_strategy = str(training_args.eval_strategy).lower()
     callbacks = []
