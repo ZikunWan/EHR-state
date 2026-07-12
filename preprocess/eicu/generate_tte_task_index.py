@@ -16,13 +16,12 @@ if PROJECT_ROOT not in sys.path:
 from preprocess.tte_utils import add_duration_fields, write_csv
 
 
-EICU_TTE_TASKS = {
-    "mortality": ("Time_to_ICU_or_Hospital_Mortality", 1.0),
-    "long_term_mortality": ("Time_to_Long_Term_Mortality", 14.0),
-    "los_3day": ("Time_to_ICU_Discharge", 30.0),
-    "los_7day": ("Time_to_ICU_Discharge", 30.0),
+EICU_TTE_SOURCE_TASKS = {
+    "mortality",
+    "long_term_mortality",
+    "los_3day",
+    "los_7day",
 }
-EICU_DEATH_SOURCE_TASKS = {"mortality", "long_term_mortality"}
 
 
 def synthetic_time(offset_minutes: float) -> datetime:
@@ -48,21 +47,22 @@ def build_split(args, split: str):
     samples = [
         sample
         for sample in load_json_records(sample_info_path(args, split))
-        if sample.get("task_name") in EICU_TTE_TASKS
-        and (
-            not args.death_only
-            or sample.get("task_name") in EICU_DEATH_SOURCE_TASKS
-        )
+        if sample.get("task_name") in EICU_TTE_SOURCE_TASKS
     ]
 
+    samples_by_stay = {}
+    for sample in samples:
+        samples_by_stay.setdefault(int(sample["icustay_id"]), []).append(sample)
+
     rows_by_task = {}
-    for sample in tqdm(samples, desc=f"eicu {split}", unit="sample", dynamic_ncols=True):
-        source_task = sample["task_name"]
-        cohort = cohorts.get(int(sample["icustay_id"]))
+    for icustay_id, stay_samples in tqdm(
+        samples_by_stay.items(), desc=f"eicu {split}", unit="stay", dynamic_ncols=True
+    ):
+        cohort = cohorts.get(icustay_id)
         if cohort is None:
             continue
-
-        task_name, horizon_days = EICU_TTE_TASKS[source_task]
+        sample = stay_samples[0]
+        source_tasks = {str(item["task_name"]) for item in stay_samples}
         prediction_time = synthetic_time(
             (float(sample.get("obs_hours", 12)) + float(sample.get("gap_hours", 0))) * 60.0
         )
@@ -72,31 +72,27 @@ def build_split(args, split: str):
             cohort.get("HOS_DISCHARGE_LOCATION", "")
         ).lower() == "death"
 
-        if source_task in EICU_DEATH_SOURCE_TASKS:
-            event_time = synthetic_time(discharge_time) if death else None
-            censor_time = synthetic_time(discharge_time)
-            event_observed = death
-        else:
-            event_time = synthetic_time(out_time)
-            censor_time = event_time
-            event_observed = True
-
-        row = {
-            "icustay_id": sample["icustay_id"],
-            "patient_id": sample.get("patient_id", ""),
-            "task_name": task_name,
-            "source_binary_task": source_task,
-            "label": "tte",
-            "split": split,
-            "obs_hours": sample.get("obs_hours", ""),
-            "gap_hours": sample.get("gap_hours", ""),
-            "pred_hours": sample.get("pred_hours", ""),
+        base_row = {
+            "icustay_id": sample["icustay_id"], "patient_id": sample.get("patient_id", ""),
+            "label": "tte", "split": split, "obs_hours": sample.get("obs_hours", ""),
+            "gap_hours": sample.get("gap_hours", ""), "pred_hours": sample.get("pred_hours", ""),
         }
-        row = add_duration_fields(
-            row, prediction_time, event_time, censor_time, event_observed, horizon_days
-        )
-        if row is not None:
-            rows_by_task.setdefault(task_name, []).append(row)
+        if source_tasks & {"mortality", "long_term_mortality"}:
+            row = dict(base_row, task_name="Time_to_Mortality", source_binary_task="mortality+long_term_mortality")
+            row = add_duration_fields(
+                row, prediction_time,
+                synthetic_time(discharge_time) if death else None,
+                synthetic_time(discharge_time), death, 14.0,
+            )
+            if row is not None:
+                rows_by_task.setdefault("Time_to_Mortality", []).append(row)
+        if source_tasks & {"los_3day", "los_7day"}:
+            horizon_days = max(7.0 - (prediction_time - synthetic_time(0)).total_seconds() / 86400.0, 1.0)
+            row = dict(base_row, task_name="Time_to_ICU_Discharge", source_binary_task="los_3day+los_7day")
+            event_time = synthetic_time(out_time)
+            row = add_duration_fields(row, prediction_time, event_time, event_time, True, horizon_days)
+            if row is not None:
+                rows_by_task.setdefault("Time_to_ICU_Discharge", []).append(row)
 
     for task_name, rows in rows_by_task.items():
         write_csv(os.path.join(args.output_dir, split, f"{task_name}.csv"), rows)
@@ -111,7 +107,6 @@ def parse_args():
     parser.add_argument("--test_sample_info_path", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"])
-    parser.add_argument("--death_only", action="store_true")
     return parser.parse_args()
 
 

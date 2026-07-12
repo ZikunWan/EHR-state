@@ -193,15 +193,21 @@ def resolve_sample_info_paths(path_arg: str):
     return paths
 
 
+_TASK_INFO_CACHE = None
+
+
 def get_task_info():
-    task_info = {}
-    task_info.update(get_mimic_task_info())
-    task_info.update(get_eicu_task_info())
-    task_info.update(get_ehrshot_task_info())
-    task_info.update(get_mimic_iv_cdm_task_info())
-    task_info.update(get_pds_task_info())
-    task_info.update(get_renji_task_info())
-    return task_info
+    global _TASK_INFO_CACHE
+    if _TASK_INFO_CACHE is None:
+        task_info = {}
+        task_info.update(get_mimic_task_info())
+        task_info.update(get_eicu_task_info())
+        task_info.update(get_ehrshot_task_info())
+        task_info.update(get_mimic_iv_cdm_task_info())
+        task_info.update(get_pds_task_info())
+        task_info.update(get_renji_task_info())
+        _TASK_INFO_CACHE = task_info
+    return _TASK_INFO_CACHE
 
 
 def binary_task_names(task_info: dict):
@@ -684,14 +690,10 @@ def build_task_dataset(args: CacheBuildArguments, split: str):
 
 
 def tte_index_paths(args: CacheBuildArguments, dataset_name: str, split: str):
-    patterns = [
-        os.path.join(args.tte_index_dir, dataset_name, "indices", split, "*.csv"),
-        os.path.join(args.tte_index_dir, dataset_name, split, "*.csv"),
-    ]
-    paths = []
-    for pattern in patterns:
-        paths.extend(path for path in glob(pattern) if os.path.getsize(path) > 0)
-    return sorted(set(paths))
+    pattern = os.path.join(
+        args.tte_index_dir, dataset_name, "indices", split, "*.csv"
+    )
+    return sorted(path for path in glob(pattern) if os.path.getsize(path) > 0)
 
 
 def build_tte_dataset(args: CacheBuildArguments, split: str):
@@ -878,7 +880,7 @@ class TteTaskQueryDataset(torch.utils.data.Dataset):
         return {
             "table": sample["measurement_table"],
             "task": task_name,
-            "content_task": str(sample_info.get("source_binary_task", task_name)),
+            "content_task": task_name,
             "task_type_id": 1,
             "label": 0.0,
             "survival_labels": survival_labels,
@@ -1207,7 +1209,7 @@ def tte_supervision_record(tte_dataset, idx, source_registry, source_to_id):
         "sample_idx": int(sample_idx),
         "input_key": table_input_key(dataset_name, dataset, sample_info, task_name),
         "task": task_name,
-        "content_task": str(sample_info.get("source_binary_task", task_name)),
+        "content_task": task_name,
         "task_type_id": 1,
         "label": 0.0,
         "time_to_event": time_to_event,
@@ -1832,6 +1834,24 @@ def write_supervision_index(
     return metadata
 
 
+def register_supervision_task_names(
+    supervision_records_path: str,
+    task_to_id: Dict[str, int],
+    content_task_to_id: Dict[str, int],
+):
+    tasks = set()
+    content_tasks = set()
+    with open(supervision_records_path, "r", encoding="utf-8") as records_file:
+        for line in records_file:
+            record = json.loads(line)
+            tasks.add(str(record["task"]))
+            content_tasks.add(str(record["content_task"]))
+    for task_name in sorted(tasks - set(task_to_id)):
+        task_to_id[task_name] = len(task_to_id)
+    for task_name in sorted(content_tasks - set(content_task_to_id)):
+        content_task_to_id[task_name] = len(content_task_to_id)
+
+
 def build_split_cache(
     args,
     split,
@@ -1963,6 +1983,11 @@ def build_split_cache(
             input_parts.append(metadata["part"])
 
     input_parts = sorted(input_parts, key=lambda part: part["path"])
+    register_supervision_task_names(
+        supervision_records_path,
+        task_to_id,
+        content_task_to_id,
+    )
     supervision = write_supervision_index(
         split_dir=split_dir,
         run_id=run_id,
@@ -2032,12 +2057,13 @@ def main():
 
     split_task_names = set()
     split_content_task_names = set()
+    split_datasets = {}
     for split in ("train", "val"):
         dataset = build_mixed_task_dataset(args, split)
+        split_datasets[split] = dataset
         split_task_names.update(dataset.task_names())
         split_content_task_names.update(dataset.content_task_names())
         print(f"Task samples {split}: {len(dataset)}")
-        del dataset
     task_names = sorted(split_task_names)
     content_task_names = sorted(split_content_task_names)
     task_to_id = {task_name: idx for idx, task_name in enumerate(task_names)}
@@ -2057,7 +2083,7 @@ def main():
     print(f"Content tasks: {len(content_task_names)}")
     print(f"Phenotypes: {len(query_specs)}")
 
-    train_dataset = build_mixed_task_dataset(args, "train")
+    train_dataset = split_datasets.pop("train")
     build_split_cache(
         args,
         "train",
@@ -2071,7 +2097,7 @@ def main():
         run_id,
     )
     del train_dataset
-    val_dataset = build_mixed_task_dataset(args, "val")
+    val_dataset = split_datasets.pop("val")
     build_split_cache(
         args,
         "val",

@@ -7,10 +7,10 @@ TASK_INFO = {
     "mortality": {
         "metric": "auroc",
         "task_type": "binary_classification",
-        "instruction": "Given the sequence of ICU events observed in the first 12 hours of the ICU stay, predict whether the patient will die during or shortly after ICU stay in the next 24 hours.",
+        "instruction": "Given the sequence of ICU events observed in the first 12 hours of the ICU stay, predict whether the patient will die during or shortly after ICU stay in the next 48 hours.",
         "candidate_prompts": {
-            "no": "The patient will not die during or shortly after the ICU stay in the next 24 hours.",
-            "yes": "The patient will die during or shortly after the ICU stay in the next 24 hours.",
+            "no": "The patient will not die during or shortly after the ICU stay in the next 48 hours.",
+            "yes": "The patient will die during or shortly after the ICU stay in the next 48 hours.",
         },
     },
 
@@ -54,16 +54,10 @@ TASK_INFO = {
         },
     },
 
-    "Time_to_ICU_or_Hospital_Mortality": {
+    "Time_to_Mortality": {
         "metric": "survival",
         "task_type": "time_to_event",
-        "instruction": "Given the sequence of ICU events observed in the first 12 hours of the ICU stay, estimate the time to ICU or in-hospital mortality.",
-    },
-
-    "Time_to_Long_Term_Mortality": {
-        "metric": "survival",
-        "task_type": "time_to_event",
-        "instruction": "Given the sequence of ICU events observed in the first 12 hours of the ICU stay, estimate the time to mortality within the long-term follow-up window.",
+        "instruction": "Given the sequence of ICU events observed in the first 12 hours of the ICU stay, estimate the time to mortality within 14 days.",
     },
 
     "Time_to_ICU_Discharge": {
@@ -99,14 +93,14 @@ TASK_INFO = {
         "task_type": "multi_class_classification",
         "num_classes": 6,
         "candidate": ['No discharge', 'Death', 'Home', 'Rehabilitation', 'Skilled Nursing Facility', 'Other'],
-        "instruction": "Given the sequence of ICU events observed in the first 12 hours of the ICU stay, predict whether and where the patient will be discharged in the next 24 hours.",
+        "instruction": "Given the sequence of ICU events observed in the first 12 hours of the ICU stay, predict whether and where the patient will be discharged in the next 48 hours.",
         "candidate_prompts": {
-            "No discharge": "The patient will not be discharged in the next 24 hours.",
-            "Death": "The patient will die in the next 24 hours.",
-            "Home": "The patient will be discharged home in the next 24 hours.",
-            "Rehabilitation": "The patient will be discharged to rehabilitation in the next 24 hours.",
-            "Skilled Nursing Facility": "The patient will be discharged to a skilled nursing facility in the next 24 hours.",
-            "Other": "The patient will be discharged to another destination in the next 24 hours.",
+            "No discharge": "The patient will not be discharged in the next 48 hours.",
+            "Death": "The patient will die in the next 48 hours.",
+            "Home": "The patient will be discharged home in the next 48 hours.",
+            "Rehabilitation": "The patient will be discharged to rehabilitation in the next 48 hours.",
+            "Skilled Nursing Facility": "The patient will be discharged to a skilled nursing facility in the next 48 hours.",
+            "Other": "The patient will be discharged to another destination in the next 48 hours.",
         },
     },
 

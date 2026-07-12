@@ -4,6 +4,9 @@ set -euo pipefail
 MEMORY_LIMIT_GB="${MEMORY_LIMIT_GB:-900}"
 MEMORY_POLL_SECONDS="${MEMORY_POLL_SECONDS:-1}"
 SUPERVISION_WRITE_BUFFER_SIZE="${SUPERVISION_WRITE_BUFFER_SIZE:-8192}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data/zikun_workspace/input/cache/pretraining/ehr_encoder/inputs}"
+RUN_ID="${RUN_ID:-pretraining_cache_v5_sorted_text_embeddings}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/structEHR/bin/python}"
 
 collect_process_tree() {
     local root_pid="$1"
@@ -72,7 +75,7 @@ memory_watchdog() {
     done
 }
 
-MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 python ./preprocess/build_unified_pretrain_cache.py \
+MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 "${PYTHON_BIN}" ./preprocess/build_unified_pretrain_cache.py \
     --dataset mimic_iv eicu ehrshot \
     --root_dir "/data/zikun_workspace/mimic-iv-3.1_tabular" \
     --eicu_root_dir "/data/zikun_workspace/eicu-crd" \
@@ -96,8 +99,8 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 python ./preprocess/build_unified_pretrain_cache
     --include_pretraining_context true \
     --tte_index_dir "/data/zikun_workspace/input/tasks/time_to_event" \
     --phenotype_spec_path "/data/zikun_workspace/input/cache/pretraining/phenotype_metric_learning/phenotype_query_specs.json" \
-    --output_dir "/data/zikun_workspace/input/cache/pretraining/ehr_encoder/inputs" \
-    --run_id "pretraining_cache_v5_sorted_text_embeddings" \
+    --output_dir "${OUTPUT_DIR}" \
+    --run_id "${RUN_ID}" \
     --resume true \
     --min_table_rows 2 \
     --part_size 2048 \

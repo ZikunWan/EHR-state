@@ -22,9 +22,9 @@ from preprocess.tte_utils import (
 
 
 EHRSHOT_TTE_TASKS = {
-    "guo_los": ("Time_to_Hospital_Discharge", 30.0),
-    "guo_readmission": ("Time_to_Hospital_Readmission", 30.0),
-    "guo_icu": ("Time_to_ICU_Transfer", 30.0),
+    "guo_los": "Time_to_Hospital_Discharge",
+    "guo_readmission": "Time_to_Hospital_Readmission",
+    "guo_icu": "Time_to_ICU_Transfer",
 }
 _WORKER_ROOT_DIR = None
 
@@ -50,11 +50,12 @@ def tte_row(source: Dict[str, str], patient_rows: List[Dict[str, str]]) -> Optio
     source_task = source.get("task_name")
     if source_task not in EHRSHOT_TTE_TASKS:
         return None
-    task_name, horizon_days = EHRSHOT_TTE_TASKS[source_task]
+    task_name = EHRSHOT_TTE_TASKS[source_task]
     prediction_time = parse_time(source.get("prediction_time"))
     if prediction_time is None:
         return None
 
+    horizon_days = 30.0
     horizon_time = prediction_time + timedelta(days=horizon_days)
     event_time = None
     censor_time = horizon_time
@@ -68,6 +69,10 @@ def tte_row(source: Dict[str, str], patient_rows: List[Dict[str, str]]) -> Optio
             if ("inpatient" in text or "visit/ip" in text) and start and end and start <= prediction_time <= end:
                 event_time = end
                 censor_time = end
+                horizon_days = max(
+                    (end - prediction_time).total_seconds() / 86400.0,
+                    1.0 / 1440.0,
+                )
                 break
     elif source_task == "guo_readmission":
         for row in patient_rows:
@@ -79,6 +84,24 @@ def tte_row(source: Dict[str, str], patient_rows: List[Dict[str, str]]) -> Optio
                 event_time = start
                 break
     else:
+        admission_end = None
+        for row in patient_rows:
+            if row.get("omop_table") != "visit_occurrence":
+                continue
+            text = f"{row.get('code', '')} {row.get('description', '')}".lower()
+            start = parse_time(row.get("start"))
+            end = parse_time(row.get("end"))
+            if ("inpatient" in text or "visit/ip" in text) and start and end and start <= prediction_time <= end:
+                admission_end = end
+                break
+        if admission_end is None:
+            return None
+        censor_time = admission_end
+        horizon_days = max(
+            (admission_end - prediction_time).total_seconds() / 86400.0,
+            1.0 / 1440.0,
+        )
+        horizon_time = admission_end
         for row in patient_rows:
             text = f"{row.get('code', '')} {row.get('description', '')}".lower()
             start = parse_time(row.get("start"))
@@ -86,7 +109,7 @@ def tte_row(source: Dict[str, str], patient_rows: List[Dict[str, str]]) -> Optio
                 event_time = start
                 break
 
-    observed = event_time is not None and str(source.get("label", "")).lower() == "true"
+    observed = event_time is not None
     out = dict(source)
     out["task_name"] = task_name
     out["source_binary_task"] = source_task
@@ -94,69 +117,20 @@ def tte_row(source: Dict[str, str], patient_rows: List[Dict[str, str]]) -> Optio
     return add_duration_fields(out, prediction_time, event_time, censor_time, observed, horizon_days)
 
 
-def patient_event_times(rows: List[Dict[str, str]]):
-    death_time = None
-    last_time = None
-    for row in rows:
-        for key in ("start", "end"):
-            current_time = parse_time(row.get(key))
-            if current_time is not None and (last_time is None or current_time > last_time):
-                last_time = current_time
-        table = str(row.get("omop_table", "")).strip().lower()
-        description = str(row.get("description", "")).strip().lower()
-        if table == "death" or "patient status \"deceased\"" in description:
-            current_time = parse_time(row.get("start")) or parse_time(row.get("end"))
-            if current_time is not None and (death_time is None or current_time < death_time):
-                death_time = current_time
-    return death_time, last_time
-
-
-def death_row(source: Dict[str, str], patient_rows: List[Dict[str, str]], horizon_days: float):
-    prediction_time = parse_time(source.get("prediction_time"))
-    if prediction_time is None:
-        return None
-    death_time, last_time = patient_event_times(patient_rows)
-    if last_time is None:
-        return None
-    out = dict(source)
-    out["task_name"] = "Time_to_Mortality"
-    out["source_binary_task"] = "ehrshot_death"
-    out["label"] = "tte"
-    return add_duration_fields(
-        out, prediction_time, death_time, last_time, death_time is not None, horizon_days
-    )
-
-
-def process_patient_group(payload: Tuple[str, List[Dict[str, str]], bool, float]):
-    patient_id, source_records, death_only, death_horizon_days = payload
+def process_patient_group(payload: Tuple[str, List[Dict[str, str]]]):
+    patient_id, source_records = payload
     patient_rows = load_patient(_WORKER_ROOT_DIR, patient_id)
-    if death_only:
-        return [
-            death_row(source, patient_rows, death_horizon_days)
-            for source in source_records
-        ]
     return [tte_row(source, patient_rows) for source in source_records]
 
 
 def build_split(args, split: str):
-    if args.death_only:
-        seen = set()
-        source_records = []
-        for source in read_csv_records(index_path(args, split)):
-            key = (source.get("patient_id"), source.get("prediction_time"))
-            if key in seen:
-                continue
-            seen.add(key)
-            source_records.append(source)
-    else:
-        source_records = [
-            source
-            for source in read_csv_records(index_path(args, split))
-            if source.get("task_name") in EHRSHOT_TTE_TASKS
-        ]
+    source_records = [
+        source for source in read_csv_records(index_path(args, split))
+        if source.get("task_name") in EHRSHOT_TTE_TASKS
+    ]
 
     group_payloads = [
-        (patient_id, records, args.death_only, args.death_horizon_days)
+        (patient_id, records)
         for patient_id, records in group_records_by_key(
             source_records, lambda record: record["patient_id"]
         )
@@ -204,8 +178,6 @@ def parse_args():
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     parser.add_argument("--num_workers", type=int, default=16)
     parser.add_argument("--worker_chunksize", type=int, default=32)
-    parser.add_argument("--death_only", action="store_true")
-    parser.add_argument("--death_horizon_days", type=float, default=3650.0)
     return parser.parse_args()
 
 

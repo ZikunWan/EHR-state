@@ -2,6 +2,9 @@
 set -euo pipefail
 source "$(dirname "$0")/../common/silent_info.sh"
 
+TORCH_NCCL_DESYNC_DEBUG=1 \
+TORCH_NCCL_DUMP_ON_TIMEOUT=1 \
+TORCH_NCCL_TRACE_BUFFER_SIZE=2000 \
 MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py \
     --deepspeed "./ds_config_zero2.json" \
     --dataset mimic_iv eicu ehrshot \
@@ -28,10 +31,13 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py
     --gradient_accumulation_steps 1 \
     --activation_checkpointing false \
     --grad_cache true \
-    --grad_cache_micro_batch_size 8 \
+    --grad_cache_micro_batch_size 12 \
+    --grad_cache_embedding_micro_batch_size 32 \
     --length_grouped_batching true \
+    --length_bucket_count 128 \
+    --dataloader_drop_last false \
     --text_embedding_on_gpu true \
-    --dataloader_num_workers 4 \
+    --dataloader_num_workers 0 \
     --learning_rate 1e-5 \
     --lr_scheduler_type "cosine" \
     --min_lr_ratio 0.1 \
@@ -47,8 +53,8 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py
     --relation_l2_weight 0.0 \
     --min_pair_delta 0.0 \
     --num_train_epochs 1 \
-    --logging_steps 1 \
-    --save_steps 1000 \
+    --logging_steps 50 \
+    --save_steps 500 \
     --eval_strategy "no" \
     --eval_steps 5000 \
     --save_total_limit 1 \
@@ -59,4 +65,5 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py
     --report_to "wandb" \
     --wandb_project "Joint_Pretraining" \
     --run_name "1B_pretrain" \
-    --output_dir "/data/zikun_workspace/checkpoints/pretraining/1B"
+    --output_dir "/data/zikun_workspace/checkpoints/pretraining/1B" \
+    --resume_from_checkpoint "/data/zikun_workspace/checkpoints/pretraining/1B/checkpoint-11500"

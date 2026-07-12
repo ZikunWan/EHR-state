@@ -24,32 +24,15 @@ from preprocess.tte_utils import (
 
 
 MIMIC_TTE_TASKS = {
-    "ED_Inpatient_Mortality": ("Time_to_Inpatient_Mortality_after_ED", 30.0),
+    "ED_Inpatient_Mortality": ("Time_to_Inpatient_Mortality_after_ED", None),
     "ED_ICU_Tranfer_12hour": ("Time_to_ICU_Transfer_after_ED", 0.5),
     "ED_Reattendance_3day": ("Time_to_ED_Reattendance", 3.0),
-    "ED_Critical_Outcomes": ("Time_to_ED_Critical_Outcome", 30.0),
-    "Readmission_30day": ("Time_to_Hospital_Readmission", 30.0),
     "Readmission_60day": ("Time_to_Hospital_Readmission", 60.0),
-    "Inpatient_Mortality": ("Time_to_Inpatient_Mortality", 30.0),
-    "LengthOfStay_3day": ("Time_to_Hospital_Discharge", 30.0),
-    "LengthOfStay_7day": ("Time_to_Hospital_Discharge", 30.0),
-    "ICU_Mortality_1day": ("Time_to_ICU_Mortality", 1.0),
-    "ICU_Mortality_2day": ("Time_to_ICU_Mortality", 2.0),
-    "ICU_Mortality_3day": ("Time_to_ICU_Mortality", 3.0),
-    "ICU_Mortality_7day": ("Time_to_ICU_Mortality", 7.0),
+    "Inpatient_Mortality": ("Time_to_Inpatient_Mortality", None),
+    "LengthOfStay_7day": ("Time_to_Hospital_Discharge", None),
     "ICU_Mortality_14day": ("Time_to_ICU_Mortality", 14.0),
-    "ICU_Stay_7day": ("Time_to_ICU_Discharge", 30.0),
-    "ICU_Stay_14day": ("Time_to_ICU_Discharge", 30.0),
-    "ICU_Readmission": ("Time_to_ICU_Readmission", 30.0),
-}
-MIMIC_DEATH_SOURCE_TASKS = {
-    "ED_Inpatient_Mortality",
-    "Inpatient_Mortality",
-    "ICU_Mortality_1day",
-    "ICU_Mortality_2day",
-    "ICU_Mortality_3day",
-    "ICU_Mortality_7day",
-    "ICU_Mortality_14day",
+    "ICU_Stay_14day": ("Time_to_ICU_Discharge", None),
+    "ICU_Readmission": ("Time_to_ICU_Readmission", None),
 }
 _WORKER_EHR_DIR = None
 
@@ -80,15 +63,23 @@ def first_after(
     return None
 
 
-def same_hadm_last_time(trajectory, start_idx: int, hadm_id: Optional[str]):
-    last_time = None
-    for event in trajectory[start_idx + 1 :]:
+def admission_times(trajectory, hadm_id: Optional[str]):
+    for event in trajectory:
+        if event.get("file_name") != "admissions":
+            continue
         if str(safe_read(event.get("hadm_id"))) != str(hadm_id):
             continue
-        current = event_start(event)
-        if current is not None:
-            last_time = current
-    return last_time
+        return item_time(event, "admittime") or event_start(event), item_time(event, "dischtime")
+    return None, None
+
+
+def days_between(start, end):
+    if start is None or end is None:
+        return None
+    return min(
+        max((end - start).total_seconds() / 86400.0, 1.0 / 1440.0),
+        365.0,
+    )
 
 
 def build_row(source: Dict[str, str], trajectory: List[Dict[str, Any]]):
@@ -106,6 +97,7 @@ def build_row(source: Dict[str, str], trajectory: List[Dict[str, Any]]):
 
     anchor = trajectory[anchor_idx]
     hadm_id = str(safe_read(source.get("hadm_id") or anchor.get("hadm_id")))
+    admission_time, hospital_discharge_time = admission_times(trajectory, hadm_id)
     patient_dod = parse_time((trajectory[0].get("items") or [{}])[0].get("dod"))
     prediction_time = None
     event_time = None
@@ -117,11 +109,13 @@ def build_row(source: Dict[str, str], trajectory: List[Dict[str, Any]]):
         icu_event = first_after(trajectory, anchor_idx, "icustays", hadm_id)
         next_ed = first_after(trajectory, anchor_idx, "edstays")
         death_time = patient_dod
-        last_time = same_hadm_last_time(trajectory, anchor_idx, hadm_id)
         if source_task == "ED_Inpatient_Mortality":
+            if hospital_discharge_time is None:
+                return None
             event_time = death_time
-            event_observed = bool(death_time and (last_time is None or death_time <= last_time))
-            censor_time = last_time
+            censor_time = hospital_discharge_time
+            event_observed = bool(death_time and censor_time and death_time <= censor_time)
+            horizon_days = days_between(prediction_time, censor_time)
         elif source_task == "ED_ICU_Tranfer_12hour":
             event_time = event_start(icu_event) if icu_event else None
             event_observed = event_time is not None
@@ -130,16 +124,6 @@ def build_row(source: Dict[str, str], trajectory: List[Dict[str, Any]]):
             event_time = event_start(next_ed) if next_ed else None
             event_observed = event_time is not None
             censor_time = prediction_time + timedelta(days=horizon_days) if prediction_time else None
-        else:
-            candidates = []
-            icu_time = event_start(icu_event) if icu_event else None
-            if icu_time is not None:
-                candidates.append(icu_time)
-            if death_time is not None and (last_time is None or death_time <= last_time):
-                candidates.append(death_time)
-            event_time = min(candidates) if candidates else None
-            event_observed = event_time is not None
-            censor_time = last_time
     elif source_task.startswith("Readmission_"):
         prediction_time = event_start(anchor)
         next_admission = first_after(trajectory, anchor_idx, "admissions")
@@ -153,28 +137,35 @@ def build_row(source: Dict[str, str], trajectory: List[Dict[str, Any]]):
             event_time = patient_dod
             event_observed = bool(event_time and discharge_time and event_time <= discharge_time)
             censor_time = discharge_time
+            horizon_days = days_between(prediction_time, discharge_time)
         else:
             event_time = discharge_time
             event_observed = event_time is not None
             censor_time = discharge_time
+            threshold_time = admission_time + timedelta(days=7) if admission_time else discharge_time
+            horizon_days = days_between(prediction_time, threshold_time)
     elif source_task.startswith("ICU_"):
         prediction_time = event_start(trajectory[context_end - 1])
         icu_out = item_time(anchor, "outtime")
         next_icu = first_after(trajectory, anchor_idx, "icustays", hadm_id)
         if source_task.startswith("ICU_Mortality_"):
             event_time = patient_dod
-            event_observed = bool(event_time and icu_out and event_time <= icu_out)
-            censor_time = icu_out
+            event_observed = bool(event_time and hospital_discharge_time and event_time <= hospital_discharge_time)
+            censor_time = hospital_discharge_time
         elif source_task.startswith("ICU_Stay_"):
             event_time = icu_out
             event_observed = event_time is not None
             censor_time = icu_out
+            icu_in = item_time(anchor, "intime") or event_start(anchor)
+            threshold_time = icu_in + timedelta(days=14) if icu_in else icu_out
+            horizon_days = days_between(prediction_time, threshold_time)
         else:
             event_time = event_start(next_icu) if next_icu else None
             event_observed = event_time is not None
-            censor_time = icu_out
+            censor_time = hospital_discharge_time
+            horizon_days = days_between(prediction_time, hospital_discharge_time)
 
-    if prediction_time is None:
+    if prediction_time is None or horizon_days is None:
         return None
     row = dict(source)
     row["source_binary_task"] = source_task
@@ -205,11 +196,7 @@ def index_dir(args, split: str) -> str:
 
 
 def build_split(args, split: str):
-    source_tasks = (
-        [task for task in MIMIC_TTE_TASKS if task in MIMIC_DEATH_SOURCE_TASKS]
-        if args.death_only
-        else list(MIMIC_TTE_TASKS)
-    )
+    source_tasks = list(MIMIC_TTE_TASKS)
     records = []
     for source_task in source_tasks:
         path = os.path.join(index_dir(args, split), f"{source_task}.csv")
@@ -245,7 +232,6 @@ def build_split(args, split: str):
                     row.get("subject_id"),
                     row.get("hadm_id"),
                     row.get("task"),
-                    row.get("source_binary_task"),
                     row.get("prediction_time"),
                     row.get("horizon_days"),
                 )
@@ -273,7 +259,6 @@ def parse_args():
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     parser.add_argument("--num_workers", type=int, default=16)
     parser.add_argument("--worker_chunksize", type=int, default=32)
-    parser.add_argument("--death_only", action="store_true")
     return parser.parse_args()
 
 

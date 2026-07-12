@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Sampler
 from accelerate.utils import DistributedType
 from tqdm.auto import tqdm
 from transformers import (
@@ -20,10 +22,11 @@ from transformers import (
     HfArgumentParser,
     PreTrainedModel,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     set_seed,
 )
-from transformers.trainer_pt_utils import LengthGroupedSampler
+from transformers.trainer_utils import seed_worker
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -119,6 +122,16 @@ class DataArguments:
 
 @dataclass
 class PretrainingArguments(TrainingArguments):
+    # Keep the Accelerate data-dispatch policy with the training code instead
+    # of requiring a separate JSON file. CLI ``--accelerator_config`` can still
+    # override this default when a different policy is needed.
+    accelerator_config: dict = field(
+        default_factory=lambda: {
+            "split_batches": True,
+            "even_batches": False,
+            "dispatch_batches": False,
+        }
+    )
     output_dir: str = field(
         default="/data/zikun_workspace/checkpoints/pretraining/joint_pretrain"
     )
@@ -155,7 +168,9 @@ class PretrainingArguments(TrainingArguments):
     activation_checkpointing: bool = field(default=False)
     grad_cache: bool = field(default=False)
     grad_cache_micro_batch_size: int = field(default=8)
+    grad_cache_embedding_micro_batch_size: int = field(default=32)
     length_grouped_batching: bool = field(default=False)
+    length_bucket_count: int = field(default=128)
     text_embedding_on_gpu: bool = field(default=False)
 
     def __post_init__(self):
@@ -186,6 +201,12 @@ class PretrainingArguments(TrainingArguments):
             raise ValueError("Minimum pair delta must be non-negative.")
         if self.grad_cache_micro_batch_size <= 0:
             raise ValueError("GradCache micro batch size must be positive.")
+        if self.grad_cache_embedding_micro_batch_size <= 0:
+            raise ValueError(
+                "GradCache embedding micro batch size must be positive."
+            )
+        if self.length_bucket_count <= 0:
+            raise ValueError("Length bucket count must be positive.")
         if self.grad_cache and self.gradient_accumulation_steps != 1:
             raise ValueError(
                 "GradCache currently requires gradient_accumulation_steps=1."
@@ -212,6 +233,105 @@ FORMAT_QUERY_TEXTS = {
     FORMAT_QUERY_KEYS[TASK_TYPE_TTE]: "This is a time-to-event task.",
     FORMAT_QUERY_KEYS[TASK_TYPE_MULTICLASS]: "This is a classification task.",
 }
+
+
+class BucketBatchSampler(Sampler[List[int]]):
+    """Length buckets that emit complete global batches.
+
+    The returned batches are global batches. Accelerate splits each batch across
+    ranks, so every rank processes a similarly-sized slice of the same bucket.
+    This avoids the rank-to-rank sequence-length skew caused by sharding local
+    length-grouped batches after they have already been formed.
+    """
+
+    def __init__(
+        self,
+        lengths,
+        local_batch_size: int,
+        world_size: int,
+        bucket_count: int,
+        seed: int,
+        drop_last: bool = False,
+    ):
+        if local_batch_size <= 0:
+            raise ValueError("local_batch_size must be positive")
+        if world_size <= 0:
+            raise ValueError("world_size must be positive")
+        if bucket_count <= 0:
+            raise ValueError("bucket_count must be positive")
+
+        lengths = np.asarray(lengths)
+        if lengths.ndim != 1 or lengths.size == 0:
+            raise ValueError("lengths must be a non-empty 1D array")
+
+        self.local_batch_size = int(local_batch_size)
+        self.world_size = int(world_size)
+        self.batch_size = self.local_batch_size * self.world_size
+        self.bucket_count = int(bucket_count)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+
+        # Quantile buckets keep each global batch in a narrow length range.
+        # The index array is small compared with the preprocessed sequence cache.
+        sorted_indices = np.argsort(lengths, kind="stable")
+        effective_bucket_count = min(
+            self.bucket_count,
+            max(1, len(sorted_indices) // self.batch_size),
+        )
+        self.buckets = [
+            bucket.astype(np.int64, copy=False)
+            for bucket in np.array_split(sorted_indices, effective_bucket_count)
+            if len(bucket) > 0
+        ]
+        self._length = sum(
+            (len(bucket) + self.batch_size - 1) // self.batch_size
+            if not self.drop_last
+            else len(bucket) // self.batch_size
+            for bucket in self.buckets
+        )
+
+    def __len__(self):
+        return self._length
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        bucket_order = torch.randperm(
+            len(self.buckets), generator=generator
+        ).tolist()
+
+        for bucket_idx in bucket_order:
+            bucket = self.buckets[bucket_idx]
+            batches = []
+            full_length = (len(bucket) // self.batch_size) * self.batch_size
+            for start in range(0, full_length, self.batch_size):
+                batch = bucket[start : start + self.batch_size]
+                permutation = torch.randperm(
+                    self.batch_size, generator=generator
+                ).numpy()
+                batches.append(batch[permutation].tolist())
+
+            if not self.drop_last and full_length < len(bucket):
+                tail = bucket[full_length:]
+                padding = np.resize(
+                    bucket,
+                    self.batch_size - len(tail),
+                )
+                batch = np.concatenate((tail, padding))
+                permutation = torch.randperm(
+                    self.batch_size, generator=generator
+                ).numpy()
+                batches.append(batch[permutation].tolist())
+
+            batch_order = torch.randperm(
+                len(batches), generator=generator
+            ).tolist()
+            for batch_idx in batch_order:
+                yield batches[batch_idx]
 
 
 class PreprocessedPretrainingTaskDataset(torch.utils.data.Dataset):
@@ -524,6 +644,12 @@ class PreprocessedPretrainingTaskDataset(torch.utils.data.Dataset):
         opened = self._open_part(part_idx)
         row_start = int(opened["offsets"][local_idx])
         row_end = int(opened["offsets"][local_idx + 1])
+        if self.max_table_len is not None:
+            # Apply the same right-truncation before copying from the memmap.
+            # Some cached encounters contain >200k rows; loading the complete
+            # sequence and truncating later in the collator can stall one rank
+            # long enough for the other ranks to hit an NCCL timeout.
+            row_start = max(row_start, row_end - int(self.max_table_len))
 
         sample = {
             field_name: torch.from_numpy(
@@ -1025,18 +1151,13 @@ class JointPretrainingModel(PreTrainedModel):
         )
         local_mask = phenotype_mask.to(local_embeddings.device).bool()
 
-        relations = self.relation_vectors(
-            local_embeddings.dtype, local_embeddings.device
-        )
         delta_embeddings = global_embeddings.unsqueeze(0) - local_embeddings.unsqueeze(1)
-        pred_delta = torch.einsum("bgd,qd->bgq", delta_embeddings, relations)
-
         scales = self._delta_scales(global_values, global_mask)
-        true_delta = (
-            global_values.unsqueeze(0) - local_values.unsqueeze(1)
-        ) / scales.view(1, 1, -1)
         pair_mask = local_mask.unsqueeze(1) & global_mask.unsqueeze(0)
         if self.min_pair_delta > 0:
+            true_delta = (
+                global_values.unsqueeze(0) - local_values.unsqueeze(1)
+            ) / scales.view(1, 1, -1)
             pair_mask = pair_mask & (true_delta.abs() >= self.min_pair_delta)
 
         local_batch_size = local_embeddings.size(0)
@@ -1052,40 +1173,70 @@ class JointPretrainingModel(PreTrainedModel):
         pair_mask = pair_mask & (~self_mask.unsqueeze(-1))
 
         pair_count = pair_mask.float().sum()
-        if pair_count <= 0:
+        global_pair_count = pair_count.detach().clone()
+        if pml.is_distributed():
+            dist.all_reduce(global_pair_count, op=dist.ReduceOp.SUM)
+        if global_pair_count.item() <= 0:
+            relations = self.relation_vectors(
+                local_embeddings.dtype, local_embeddings.device
+            )
             zero = local_embeddings.sum() * 0.0 + relations.sum() * 0.0
             return {
                 "loss": zero,
                 "loss_sum": zero.detach(),
                 "abs_error_sum": zero.detach(),
                 "squared_error_sum": zero.detach(),
-                "pair_count": zero.detach(),
+                "pair_count": pair_count.detach(),
             }
 
+        active_phenotypes = pair_mask.any(dim=(0, 1))
+        relations = self.relation_vectors(
+            local_embeddings.dtype, local_embeddings.device
+        )
+        active_relations = relations[active_phenotypes]
+        if self.min_pair_delta > 0:
+            true_delta = true_delta[..., active_phenotypes]
+        else:
+            true_delta = (
+                global_values[..., active_phenotypes].unsqueeze(0)
+                - local_values[..., active_phenotypes].unsqueeze(1)
+            ) / scales[active_phenotypes].view(1, 1, -1)
+        pair_mask = pair_mask[..., active_phenotypes]
+        pair_mask_float = pair_mask.to(true_delta.dtype)
+        pred_delta = torch.einsum(
+            "bgd,qd->bgq", delta_embeddings, active_relations
+        )
         projection_error = pred_delta - true_delta
-        projection_terms = self._huber(projection_error, self.huber_delta)
-        projection_loss_sum = projection_terms[pair_mask].sum()
-        projection_loss = projection_loss_sum / pair_count
+        pair_mask_float = pair_mask.to(projection_error.dtype)
+        valid_projection_error = projection_error[pair_mask]
+        projection_terms = self._huber(
+            valid_projection_error, self.huber_delta
+        )
+        projection_loss_sum = projection_terms.sum()
+        projection_loss = projection_loss_sum / pair_count.clamp_min(1.0)
 
-        loss = self.projection_loss_weight * projection_loss
+        # Keep every rank connected to the same encoder/relation graph even
+        # when its local pair mask is empty but another rank has valid pairs.
+        graph_anchor = projection_error.sum() * 0.0 + relations.sum() * 0.0
+        loss = self.projection_loss_weight * projection_loss + graph_anchor
         loss_sum = self.projection_loss_weight * projection_loss_sum
 
         if self.transe_loss_weight > 0:
             transe_target = true_delta.unsqueeze(-1) * relations.view(
-                1, 1, relations.size(0), relations.size(1)
+                1, 1, active_relations.size(0), active_relations.size(1)
             )
             transe_error = delta_embeddings.unsqueeze(2) - transe_target
             transe_terms = transe_error.pow(2).mean(dim=-1)
-            transe_loss_sum = transe_terms[pair_mask].sum()
-            transe_loss = transe_loss_sum / pair_count
+            transe_loss_sum = (transe_terms * pair_mask_float).sum()
+            transe_loss = transe_loss_sum / pair_count.clamp_min(1.0)
             loss = loss + self.transe_loss_weight * transe_loss
             loss_sum = loss_sum + self.transe_loss_weight * transe_loss_sum
 
         if self.relation_l2_weight > 0:
             loss = loss + self.relation_l2_weight * relations.pow(2).mean()
 
-        abs_error_sum = projection_error[pair_mask].abs().sum()
-        squared_error_sum = projection_error[pair_mask].pow(2).sum()
+        abs_error_sum = valid_projection_error.abs().sum()
+        squared_error_sum = valid_projection_error.pow(2).sum()
         return {
             "loss": loss,
             "loss_sum": loss_sum.detach(),
@@ -1192,6 +1343,16 @@ class JointPretrainingModel(PreTrainedModel):
         raise ValueError(f"Unsupported objective: {objective}")
 
 
+class ResumeScheduleCallback(TrainerCallback):
+    """Use current CLI logging/save intervals after checkpoint resume."""
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        state.logging_steps = args.logging_steps
+        state.eval_steps = args.eval_steps
+        state.save_steps = args.save_steps
+        return control
+
+
 class JointPretrainingTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1206,22 +1367,53 @@ class JointPretrainingTrainer(Trainer):
         }
         self._component_count = 0
 
-    def _get_train_sampler(self, train_dataset=None):
-        train_dataset = self.train_dataset if train_dataset is None else train_dataset
+    def get_train_dataloader(self):
         if not self.args.length_grouped_batching:
-            return super()._get_train_sampler(train_dataset)
-        if train_dataset is None or train_dataset.lengths is None:
+            return super().get_train_dataloader()
+
+        if self.train_dataset is None:
+            raise ValueError("Training requires a train_dataset.")
+        if self.train_dataset.lengths is None:
             raise ValueError(
                 "Length-grouped batching requires precomputed dataset lengths."
             )
-        generator = torch.Generator()
-        generator.manual_seed(
-            self.args.data_seed if self.args.data_seed is not None else self.args.seed
+
+        data_collator = self._get_collator_with_removed_columns(
+            self.data_collator,
+            description="Training",
         )
-        return LengthGroupedSampler(
-            self.args.train_batch_size * self.args.gradient_accumulation_steps,
-            lengths=train_dataset.lengths,
-            generator=generator,
+        seed = (
+            self.args.data_seed
+            if self.args.data_seed is not None
+            else self.args.seed
+        )
+        batch_sampler = BucketBatchSampler(
+            lengths=self.train_dataset.lengths,
+            local_batch_size=self._train_batch_size,
+            world_size=self.accelerator.num_processes,
+            bucket_count=self.args.length_bucket_count,
+            seed=seed,
+            drop_last=self.args.dataloader_drop_last,
+        )
+        dataloader_params = {
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+            "batch_sampler": batch_sampler,
+        }
+        if self.args.dataloader_num_workers > 0:
+            dataloader_params["prefetch_factor"] = (
+                self.args.dataloader_prefetch_factor
+            )
+            dataloader_params["worker_init_fn"] = partial(
+                seed_worker,
+                num_workers=self.args.dataloader_num_workers,
+                rank=self.args.process_index,
+            )
+
+        return self.accelerator.prepare(
+            DataLoader(self.train_dataset, **dataloader_params)
         )
 
     def create_scheduler(
@@ -1301,14 +1493,21 @@ class JointPretrainingTrainer(Trainer):
         micro_batch_size = min(
             int(self.args.grad_cache_micro_batch_size), batch_size
         )
+        embedding_micro_batch_size = min(
+            int(self.args.grad_cache_embedding_micro_batch_size), batch_size
+        )
         chunks = [
             (start, min(start + micro_batch_size, batch_size))
             for start in range(0, batch_size, micro_batch_size)
         ]
+        embedding_chunks = [
+            (start, min(start + embedding_micro_batch_size, batch_size))
+            for start in range(0, batch_size, embedding_micro_batch_size)
+        ]
 
         cached_embeddings = []
         with torch.no_grad():
-            for start, end in chunks:
+            for start, end in embedding_chunks:
                 chunk = self._slice_batch(inputs, start, end, batch_size)
                 with self.compute_loss_context_manager():
                     embeddings = model(
@@ -1789,12 +1988,16 @@ def main():
     pml.rank0_print(f"Knowledge query dimension: {task_query_dim}")
     pml.rank0_print(f"Phenotype metric queries: {len(phenotype_specs)}")
     if training_args.length_grouped_batching:
-        pml.rank0_print("Length-grouped distributed batching enabled.")
+        pml.rank0_print(
+            "Bucket batch sampling enabled: "
+            f"{training_args.length_bucket_count} buckets, "
+            "global batches split across ranks."
+        )
     if training_args.text_embedding_on_gpu:
         pml.rank0_print("BF16 text embedding matrix will reside on each GPU.")
 
     eval_strategy = str(training_args.eval_strategy).lower()
-    callbacks = []
+    callbacks = [ResumeScheduleCallback()]
     if not eval_strategy.endswith("no"):
         callbacks.append(
             EarlyStoppingCallback(

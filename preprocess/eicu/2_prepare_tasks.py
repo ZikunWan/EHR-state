@@ -75,6 +75,8 @@ def prepare_tasks(config, cohorts):
     obs_size = config.get('obs_size', 12)  # hours
     gap_size = config.get('gap_size', 12)
     pred_size = config.get('pred_size', 24)
+    mortality_pred_size = config.get('mortality_pred_size', 48)
+    imminent_discharge_pred_size = config.get('imminent_discharge_pred_size', 48)
     long_term_pred_size = config.get('long_term_pred_size', 336)
     
     print(f"\nEnabled tasks: {', '.join(enabled_tasks)}")
@@ -107,7 +109,7 @@ def prepare_tasks(config, cohorts):
                 (labeled_cohorts['HOS_DISCHARGE_LOCATION'] == 'Death')
             ) &
             (obs_size * 60 + gap_size * 60 < labeled_cohorts['DISCHTIME']) &
-            (labeled_cohorts['DISCHTIME'] <= obs_size * 60 + pred_size * 60)
+            (labeled_cohorts['DISCHTIME'] <= (obs_size + gap_size + mortality_pred_size) * 60)
         ).astype(int)
         
         mortality_dist = labeled_cohorts['mortality'].value_counts()
@@ -122,7 +124,7 @@ def prepare_tasks(config, cohorts):
                 (labeled_cohorts['HOS_DISCHARGE_LOCATION'] == 'Death')
             ) &
             (obs_size * 60 + gap_size * 60 < labeled_cohorts['DISCHTIME']) &
-            (labeled_cohorts['DISCHTIME'] <= obs_size * 60 + long_term_pred_size * 60)
+            (labeled_cohorts['DISCHTIME'] <= (obs_size + gap_size + long_term_pred_size) * 60)
         ).astype(int)
         
         ltm_dist = labeled_cohorts['long_term_mortality'].value_counts()
@@ -177,7 +179,7 @@ def prepare_tasks(config, cohorts):
         if 'imminent_discharge' in enabled_tasks:
             is_discharged = (
                 (obs_size * 60 + gap_size * 60 <= labeled_cohorts['DISCHTIME']) &
-                (labeled_cohorts['DISCHTIME'] <= obs_size * 60 + pred_size * 60)
+                (labeled_cohorts['DISCHTIME'] <= (obs_size + gap_size + imminent_discharge_pred_size) * 60)
             )
             
             labeled_cohorts['imminent_discharge'] = 'No Discharge'

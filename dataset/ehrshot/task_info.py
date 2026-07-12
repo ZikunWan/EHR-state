@@ -49,12 +49,6 @@ TASK_INFO = {
         "instruction": "Given the sequence of events that have occurred in a hospital, estimate the time to ICU transfer during the visit.",
         "candidate_prompts": {},
     },
-    "Time_to_Mortality": {
-        "metric": "survival",
-        "task_type": "time_to_event",
-        "instruction": "Given the sequence of events that have occurred for a patient, estimate the time to mortality.",
-        "candidate_prompts": {},
-    },
     "lab_anemia": {
         "metric": "auroc",
         "task_type": "multi_class_classification",

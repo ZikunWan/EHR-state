@@ -17,6 +17,7 @@ Output:
     - data/eicu-crd/processed/sample_info_val.json: Validation samples
     - data/eicu-crd/processed/sample_info_test.json: Test samples
     - data/eicu-crd/processed/sample_info_all.csv: All samples (CSV format)
+    - <classification-index-dir>/<split>/<task>.csv: Per-task classification indices
 
 Usage:
     python 3_generate_sample_info.py --config config.yaml
@@ -40,7 +41,57 @@ from pathlib import Path
 from collections import Counter
 
 
-def generate_sample_info(config, labeled_cohorts):
+def write_classification_indices(samples, output_dir):
+    index_df = pd.DataFrame(samples)
+    for split in ("train", "val", "test"):
+        split_dir = Path(output_dir) / split
+        split_dir.mkdir(parents=True, exist_ok=True)
+        split_df = index_df[index_df["split"] == split]
+        for task_name, task_df in split_df.groupby("task_name", sort=True):
+            output_path = split_dir / f"{task_name}.csv"
+            task_df.to_csv(output_path, index=False)
+            print(f"  Saved {len(task_df)} samples to {output_path}")
+
+
+def write_pretraining_indices(labeled_cohorts, patient_split, output_dir):
+    samples_by_split = {split: [] for split in ("train", "val", "test")}
+    for _, row in labeled_cohorts.iterrows():
+        patient_id = str(row["uniquepid"])
+        split = patient_split[patient_id]
+        context_end = int(np.ceil(float(row["OUTTIME"])))
+        if context_end <= 0:
+            continue
+        icustay_id = int(row["patientunitstayid"])
+        samples_by_split[split].append(
+            {
+                "dataset": "eicu",
+                "sample_id": f"eicu|{patient_id}|{icustay_id}|0|{context_end}",
+                "patient_id": patient_id,
+                "icustay_id": icustay_id,
+                "context_begin": 0,
+                "context_end": context_end,
+                "obs_hours": int(np.ceil(context_end / 60.0)),
+                "split": split,
+                "task": "pretraining_context",
+            }
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+    for split, samples in samples_by_split.items():
+        json_path = os.path.join(output_dir, f"sample_info_{split}.json")
+        csv_path = os.path.join(output_dir, f"sample_info_{split}.csv")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(samples, f, indent=2)
+        pd.DataFrame(samples).to_csv(csv_path, index=False)
+        print(f"  Saved {len(samples)} pretraining samples to {json_path}")
+
+
+def generate_sample_info(
+    config,
+    labeled_cohorts,
+    classification_index_dir=None,
+    pretraining_index_dir=None,
+):
     """
     Generate sample info for each (patient, task) combination
     
@@ -76,9 +127,8 @@ def generate_sample_info(config, labeled_cohorts):
     
     # Assign splits based on patient ID (to avoid data leakage)
     print("\nAssigning train/val/test splits...")
-    unique_patients = labeled_cohorts['uniquepid'].unique()
-    np.random.seed(42)
-    np.random.shuffle(unique_patients)
+    unique_patients = labeled_cohorts['uniquepid'].to_numpy(copy=True)
+    np.random.RandomState(config.get('random_seed', 42)).shuffle(unique_patients)
     
     n_train = int(len(unique_patients) * train_ratio)
     n_val = int(len(unique_patients) * val_ratio)
@@ -140,7 +190,15 @@ def generate_sample_info(config, labeled_cohorts):
                 'split': split,
                 'obs_hours': obs_hours,
                 'gap_hours': gap_hours,
-                'pred_hours': pred_hours
+                'pred_hours': (
+                    config.get('mortality_pred_size', 48)
+                    if task == 'mortality'
+                    else config.get('long_term_pred_size', 336)
+                    if task == 'long_term_mortality'
+                    else config.get('imminent_discharge_pred_size', 48)
+                    if task == 'imminent_discharge'
+                    else pred_hours
+                )
             }
             
             all_samples.append(sample)
@@ -169,6 +227,10 @@ def generate_sample_info(config, labeled_cohorts):
     csv_path = os.path.join(output_dir, 'sample_info_all.csv')
     df.to_csv(csv_path, index=False)
     print(f"  Saved combined CSV to {csv_path}")
+    if classification_index_dir:
+        write_classification_indices(all_samples, classification_index_dir)
+    if pretraining_index_dir:
+        write_pretraining_indices(labeled_cohorts, patient_split, pretraining_index_dir)
     
     # Print task distribution
     print("\n" + "=" * 80)
@@ -191,6 +253,16 @@ def main():
     parser.add_argument('--config', type=str, default='preprocess/eicu/config.yaml',
                         help='Path to config file')
     parser.add_argument('--labeled_cohorts', type=str, help='Path to labeled_cohorts.csv (overrides config)')
+    parser.add_argument(
+        '--classification-index-dir',
+        type=str,
+        help='Output directory for split/task classification CSV files',
+    )
+    parser.add_argument(
+        '--pretraining-index-dir',
+        type=str,
+        help='Output directory for unlabeled pretraining context indices',
+    )
     
     args = parser.parse_args()
     
@@ -209,7 +281,12 @@ def main():
     print(f"Loaded {len(labeled_cohorts)} labeled cohorts")
     
     # Generate sample info
-    samples = generate_sample_info(config, labeled_cohorts)
+    samples = generate_sample_info(
+        config,
+        labeled_cohorts,
+        classification_index_dir=args.classification_index_dir,
+        pretraining_index_dir=args.pretraining_index_dir,
+    )
     
     print("\n✓ Sample info generation completed successfully!")
 

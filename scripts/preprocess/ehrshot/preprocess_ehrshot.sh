@@ -7,6 +7,7 @@ UTILS_DIR="/data/zikun_workspace/input/cache/ehrshot/utils"
 CLASSIFICATION_INDEX_DIR="/data/zikun_workspace/input/tasks/classification/ehrshot"
 SAMPLE_INFO_DIR="/data/zikun_workspace/input/cache/ehrshot/classification_sample_info"
 TTE_INDEX_DIR="/data/zikun_workspace/input/tasks/time_to_event/ehrshot/indices"
+PRETRAINING_INDEX_DIR="/data/zikun_workspace/input/tasks/pretraining/ehrshot/indices"
 
 python preprocess/ehrshot/1_generate_patient_ehr.py \
   --ehrshot_csv "${ROOT_DIR}/data/ehrshot.csv" \
@@ -18,12 +19,9 @@ python preprocess/ehrshot/2_generate_sample_info.py \
   --splits_path "${ROOT_DIR}/splits/person_id_map.csv" \
   --benchmark_dir "${ROOT_DIR}/benchmark" \
   --patient_dir "${TABLE_DIR}/patients" \
-  --output_dir "${SAMPLE_INFO_DIR}"
-
-python preprocess/split_classification_task_index.py \
-  --dataset ehrshot \
-  --input-dir "${SAMPLE_INFO_DIR}" \
-  --output-dir "${CLASSIFICATION_INDEX_DIR}"
+  --output_dir "${SAMPLE_INFO_DIR}" \
+  --classification_index_dir "${CLASSIFICATION_INDEX_DIR}" \
+  --pretraining_index_dir "${PRETRAINING_INDEX_DIR}"
 
 python preprocess/ehrshot/generate_tte_task_index.py \
   --root_dir "${TABLE_DIR}" \

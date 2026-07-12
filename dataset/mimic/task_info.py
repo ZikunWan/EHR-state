@@ -493,15 +493,6 @@ TASK_INFO = {
         "instruction": "Given the sequence of events available after the emergency department visit, estimate the time to the next emergency department visit.",
     },
 
-    "Time_to_ED_Critical_Outcome": {
-        "target_key": None,
-        "event": "edstays",
-        "metric": "survival",
-        "bid_event": [],
-        "task_type": "time_to_event",
-        "instruction": "Given the sequence of events available after the emergency department visit, estimate the time to a critical outcome, defined as inpatient mortality or ICU transfer.",
-    },
-
     "Time_to_Hospital_Readmission": {
         "target_key": None,
         "event": "discharge",
