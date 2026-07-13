@@ -116,7 +116,7 @@ class DataArguments:
     )
     query_max_length: int = field(default=128)
     query_embedding_batch_size: int = field(default=256)
-    max_table_len: Optional[int] = field(default=4096)
+    max_table_len: Optional[int] = field(default=16384)
     min_table_rows: int = field(default=2)
 
 

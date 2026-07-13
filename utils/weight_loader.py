@@ -1,6 +1,7 @@
 import os
 from typing import Callable, Optional, Sequence
 
+import torch
 from safetensors.torch import load_file
 
 
@@ -67,6 +68,54 @@ def load_encoder_and_query_head_weights(
     model.load_state_dict(remapped, strict=False)
     if log_fn is not None:
         log_fn(f"Loaded {len(remapped)} encoder/query-head tensors from {checkpoint_path}.")
+    return model
+
+
+def load_tte_pretrained_weights(
+    model,
+    pretrained_path: str,
+    log_fn: Optional[Callable[..., None]] = None,
+):
+    """Load shared and generic TTE weights from a joint pretraining checkpoint.
+
+    The joint pretraining model has one daily survival head with 365 bins,
+    while Renji uses piecewise heads.  The daily head is copied into the
+    piecewise heads in order; if the target horizon is one bin longer, the
+    final available daily weight is repeated for that final bin.
+    """
+    state_dict, checkpoint_path = _load_checkpoint_state_dict(pretrained_path)
+    remapped = {}
+    for key, value in state_dict.items():
+        if key.startswith(("encoder.", "adapter.")):
+            remapped[key] = value
+        elif key.startswith("task_query_head."):
+            remapped["query_head." + key.removeprefix("task_query_head.")] = value
+
+    daily_weight = state_dict.get("task_survival_head.weight")
+    daily_bias = state_dict.get("task_survival_head.bias")
+    if daily_weight is not None and daily_bias is not None:
+        offset = 0
+        for stage_id, head in enumerate(model.survival_heads):
+            num_bins = head.out_features
+            end = min(offset + num_bins, daily_weight.size(0))
+            if offset >= end:
+                raise ValueError(
+                    "Pretrained TTE head does not cover the target horizon. "
+                    f"stage={stage_id}, offset={offset}, available={daily_weight.size(0)}"
+                )
+            weight = daily_weight[offset:end]
+            bias = daily_bias[offset:end]
+            if end - offset < num_bins:
+                pad_count = num_bins - (end - offset)
+                weight = torch.cat((weight, weight[-1:].expand(pad_count, -1)), dim=0)
+                bias = torch.cat((bias, bias[-1:].expand(pad_count)), dim=0)
+            remapped[f"survival_heads.{stage_id}.weight"] = weight
+            remapped[f"survival_heads.{stage_id}.bias"] = bias
+            offset += num_bins
+
+    model.load_state_dict(remapped, strict=False)
+    if log_fn is not None:
+        log_fn(f"Loaded {len(remapped)} TTE tensors from {checkpoint_path}.")
     return model
 
 

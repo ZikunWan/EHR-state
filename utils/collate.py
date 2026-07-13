@@ -433,14 +433,6 @@ def parse_classification_label(raw_label, label_map=None):
     if isinstance(raw_label, str):
         norm_label = raw_label.strip().strip('"').strip("'").strip()
         norm_label_lower = norm_label.lower()
-        if norm_label_lower == "yes":
-            return 1
-        if norm_label_lower == "no":
-            return 0
-        if norm_label_lower == "true":
-            return 1
-        if norm_label_lower == "false":
-            return 0
         if label_map is not None and norm_label in label_map:
             return int(label_map[norm_label])
         if label_map is not None and norm_label_lower in label_map:
@@ -459,6 +451,7 @@ def create_query_classifier_collate_fn(
     query_embeds: Optional[torch.Tensor] = None,
     query_embeddings_by_text: Optional[Dict[str, torch.Tensor]] = None,
     label_map: Optional[Dict[str, int]] = None,
+    include_metadata: bool = False,
 ):
     if type_vocab is None:
         type_vocab = {}
@@ -475,12 +468,15 @@ def create_query_classifier_collate_fn(
         tables = []
         labels = []
         sample_query_embeds = []
+        metadata = []
         for sample in batch:
             table = sample["measurement_table"]
             if max_table_len is not None:
                 table = table.tail(max_table_len).reset_index(drop=True)
             tables.append(table)
             labels.append(parse_classification_label(sample["output"], label_map=label_map))
+            if include_metadata:
+                metadata.append({"prediction_point": sample.get("prediction_point")})
             if query_embeddings_by_text is not None:
                 sample_query_embeds.append(query_embeddings_by_text[str(sample["instruction"])].float())
 
@@ -501,6 +497,8 @@ def create_query_classifier_collate_fn(
                 tensors["query_embeds"] = query_tensor.unsqueeze(0).expand(batch_size, -1, -1).clone()
                 tensors["query_mask"] = torch.ones(batch_size, query_tensor.size(0), dtype=torch.float32)
         tensors["labels"] = torch.tensor(labels, dtype=torch.long)
+        if include_metadata:
+            tensors["metadata"] = metadata
         return tensors
 
     return collate_fn

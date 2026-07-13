@@ -24,7 +24,7 @@ MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py
     --knowledge_encoder_base_model_path "/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT" \
     --query_max_length 64 \
     --query_embedding_batch_size 256 \
-    --max_table_len 2048 \
+    --max_table_len 16384 \
     --min_table_rows 2 \
     --per_device_train_batch_size 32 \
     --per_device_eval_batch_size 32 \

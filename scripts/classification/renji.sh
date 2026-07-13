@@ -31,7 +31,7 @@ run_train() {
     --knowledge_encoder_path "${knowledge_encoder}" \
     --knowledge_encoder_base_model_path "${base_model}" \
     --query_max_length 128 \
-    --max_table_len 4096 \
+      --max_table_len 16384 \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 32 \
     --eval_strategy steps \
@@ -63,7 +63,7 @@ run_eval() {
     --knowledge_encoder_path "${knowledge_encoder}" \
     --knowledge_encoder_base_model_path "${base_model}" \
     --query_max_length 128 \
-    --max_table_len 4096 \
+    --max_table_len 16384 \
     --batch_size 64
 }
 

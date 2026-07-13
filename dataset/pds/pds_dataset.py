@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 import random
 
 import pandas as pd
@@ -67,8 +66,22 @@ class PDSDataset(Dataset):
             self.samples = self.samples[:int(self.max_samples)]
 
     def _load_patient_splits(self):
-        with open(self.patient_split_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        splits = {}
+        split_root = self.patient_split_path
+        label_file = self.TASK_LABEL_FILES[self.task_name]
+        for trial_id in self.trial_ids:
+            trial_splits = {}
+            for split in ("train", "val", "test"):
+                split_path = os.path.join(
+                    split_root, str(trial_id), split, label_file
+                )
+                frame = pd.read_csv(split_path, dtype={"patient_id": str})
+                trial_splits[split] = [
+                    self._normalize_patient_id(value)
+                    for value in frame["patient_id"].tolist()
+                ]
+            splits[str(trial_id)] = trial_splits
+        return splits
 
     def _build_samples(self):
         samples = []

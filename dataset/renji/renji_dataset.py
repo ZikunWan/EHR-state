@@ -178,6 +178,17 @@ class RenjiDataset(Dataset):
         for sample in samples:
             sample["cutoff_day"] = int(sample["cutoff_day"])
             sample["label"] = int(sample["label"])
+        valid_samples = []
+        for sample in samples:
+            patient_info = self.patient_info_map.get(sample["fname_key"])
+            if patient_info is None:
+                continue
+            dob = pd.to_datetime(patient_info["date_of_birth"], errors="coerce")
+            if pd.isna(dob):
+                continue
+            if self._has_valid_followup_after_birth(sample, dob):
+                valid_samples.append(sample)
+        samples = valid_samples
         if self.max_samples and len(samples) > self.max_samples:
             samples = self._balanced_sample(samples, self.max_samples)
             np.random.shuffle(samples)
@@ -1220,7 +1231,7 @@ STAGE_SPECS = (
     {"stage_id": 2, "start_day": 181.0, "end_day": 366.0, "num_bins": 185},
 )
 MAX_SURVIVAL_BINS = 185
-DEATH_SURVIVAL_HORIZON_DAYS = 1825
+DEATH_SURVIVAL_HORIZON_DAYS = 365
 DEATH_STAGE_SPECS = (
     {
         "stage_id": 0,

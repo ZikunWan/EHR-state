@@ -4,7 +4,7 @@ set -euo pipefail
 CONFIG_PATH="preprocess/eicu/config.yaml"
 PROCESSED_DIR="/data/zikun_workspace/eicu-crd/processed"
 CLASSIFICATION_INDEX_DIR="/data/zikun_workspace/input/tasks/classification/eicu"
-TTE_INDEX_DIR="/data/zikun_workspace/input/tasks/time_to_event/eicu/indices"
+TTE_INDEX_DIR="/data/zikun_workspace/input/tasks/time_to_event/eicu"
 PRETRAINING_INDEX_DIR="${PROCESSED_DIR}/pretraining_index"
 
 python preprocess/eicu/1_build_cohorts.py \

@@ -690,9 +690,14 @@ def build_task_dataset(args: CacheBuildArguments, split: str):
 
 
 def tte_index_paths(args: CacheBuildArguments, dataset_name: str, split: str):
-    pattern = os.path.join(
-        args.tte_index_dir, dataset_name, "indices", split, "*.csv"
-    )
+    # eICU TTE files live directly under ``time_to_event/eicu/{split}``;
+    # MIMIC-IV and EHRSHOT retain their historical ``indices/{split}`` layout.
+    if dataset_name == "eicu":
+        pattern = os.path.join(args.tte_index_dir, dataset_name, split, "*.csv")
+    else:
+        pattern = os.path.join(
+            args.tte_index_dir, dataset_name, "indices", split, "*.csv"
+        )
     return sorted(path for path in glob(pattern) if os.path.getsize(path) > 0)
 
 

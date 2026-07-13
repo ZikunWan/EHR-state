@@ -74,7 +74,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     dataset_name: str = field(default="eicu")
-    max_table_len: int = field(default=4096)
+    max_table_len: int = field(default=16384)
     data_dir: str = field(default="")
     processed_dir: Optional[str] = field(default=None)
     train_info_path: Optional[str] = field(default=None)

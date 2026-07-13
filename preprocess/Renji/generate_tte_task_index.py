@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 DEFAULT_ROOT_DIR = "/data/zikun_workspace/input/tables/renji/raw"
 DEFAULT_SPLIT_JSON_DIR = "/data/zikun_workspace/input/metadata/splits/renji/json"
 DEFAULT_OUTPUT_DIR = "/data/zikun_workspace/input/tasks/time_to_event/renji"
-DEFAULT_DEATH_HORIZON_DAYS = 1825
+DEFAULT_DEATH_HORIZON_DAYS = 365
 TACROLIMUS_EVENT_LABEL_COLUMN = "他克莫司浓度_label"
 TACROLIMUS_STAGE_SPECS = (
     {"stage_id": 0, "start_day": 0.0, "end_day": 31.0, "num_bins": 31},

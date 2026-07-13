@@ -584,14 +584,9 @@ class EHRSHOTDataset(Dataset):
         task_info["metric"] = self.task_schema[task_name]["metric"]
         raw_label = sample['label']
         
-        if "lab_" in task_name:
-            task_info["label"] = int(raw_label)
-        else: 
-            str_label = str(raw_label).strip().lower()
-            if str_label == 'true':
-                task_info["label"] = "1"
-            else:
-                task_info["label"] = "0"
+        # EHRSHOT classification indices store all labels as integer values:
+        # binary tasks use 0/1 and multi-class lab tasks use integer class IDs.
+        task_info["label"] = int(raw_label)
         
         output_sample = {
             "idx": index,

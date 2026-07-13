@@ -4,7 +4,7 @@ source "$(dirname "$0")/../common/silent_info.sh"
 
 mode="${1:-train}"
 data_dir="/data/zikun_workspace/input/tables/PDS"
-patient_split_path="/data/zikun_workspace/input/tasks/classification/PDS/indices/patient_splits.json"
+patient_split_path="/data/zikun_workspace/input/tasks/classification/PDS"
 trial_id="102,103,105,118,119,121,122,127,128,149"
 embedding_cache="/data/zikun_workspace/input/cache/embeddings/PDS/text_embeddings.pt"
 checkpoint_root="/data/zikun_workspace/checkpoints/classification/PDS"
@@ -14,13 +14,17 @@ base_model="/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT"
 tasks=(severe_outcome adverse_event_next_visit)
 
 for task in "${tasks[@]}"; do
+  task_trial_id="${trial_id}"
+  if [[ "${task}" == "adverse_event_next_visit" ]]; then
+    task_trial_id="102,103,105,118,119,121,122,127,128"
+  fi
   if [[ "${mode}" == "train" ]]; then
     deepspeed --include localhost:4,5,6,7 train/classification/train_encoder_classifier.py \
       --deepspeed "ds_config_zero2.json" \
       --dataset_name pds \
       --data_dir "${data_dir}" \
       --patient_split_path "${patient_split_path}" \
-      --trial_id "${trial_id}" \
+      --trial_id "${task_trial_id}" \
       --task_name "${task}" \
       --embedding_cache "${embedding_cache}" \
       --output_dir "${checkpoint_root}/${task}" \
@@ -30,7 +34,7 @@ for task in "${tasks[@]}"; do
       --knowledge_encoder_path "${knowledge_encoder}" \
       --knowledge_encoder_base_model_path "${base_model}" \
       --query_max_length 128 \
-      --max_table_len 4096 \
+      --max_table_len 16384 \
       --per_device_train_batch_size 16 \
       --per_device_eval_batch_size 32 \
       --eval_strategy steps \
@@ -49,7 +53,7 @@ for task in "${tasks[@]}"; do
       --dataset_name pds \
       --data_dir "${data_dir}" \
       --patient_split_path "${patient_split_path}" \
-      --trial_id "${trial_id}" \
+      --trial_id "${task_trial_id}" \
       --split test \
       --checkpoint_dir "${checkpoint_root}/${task}" \
       --task_name "${task}" \
@@ -59,7 +63,7 @@ for task in "${tasks[@]}"; do
       --knowledge_encoder_path "${knowledge_encoder}" \
       --knowledge_encoder_base_model_path "${base_model}" \
       --query_max_length 128 \
-      --max_table_len 4096 \
+      --max_table_len 16384 \
       --batch_size 64
   else
     echo "Usage: $0 [train|eval]" >&2

@@ -74,7 +74,7 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    max_table_len: int = field(default=4096)
+    max_table_len: int = field(default=16384)
     data_dir: str = field(default="/data/zikun_workspace/input/tables/renji/raw")
     embedding_cache: str = field(
         default="/data/zikun_workspace/input/cache/embeddings/renji/text_embeddings.pt"

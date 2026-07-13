@@ -34,7 +34,7 @@ from utils.metrics import (
     create_piecewise_survival_metrics,
     softplus,
 )
-from utils.weight_loader import load_encoder_weights, load_task_model_weights
+from utils.weight_loader import load_task_model_weights, load_tte_pretrained_weights
 
 
 @dataclass
@@ -48,11 +48,10 @@ class DataArguments:
     embedding_cache: str = field(
         default="/data/zikun_workspace/input/cache/embeddings/renji/text_embeddings.pt"
     )
-    checkpoint_dir: str = field(
-        default="/data/zikun_workspace/checkpoints/renji/tacrolimus_survival"
-    )
+    checkpoint_dir: str = field(default="")
+    output_dir: Optional[str] = field(default=None)
     batch_size: int = field(default=128)
-    max_table_len: int = field(default=4096)
+    max_table_len: int = field(default=16384)
     split: str = field(default="test")
     seed: int = field(default=42)
     survival_task: str = field(default="tacrolimus_abnormal")
@@ -151,13 +150,19 @@ def main():
         stage_bins=config.stage_bins,
     )
     if model_args.pretrained_path:
-        model = load_encoder_weights(model, model_args.pretrained_path)
-    model = load_task_model_weights(model, data_args.checkpoint_dir)
+        model = load_tte_pretrained_weights(model, model_args.pretrained_path)
+    if data_args.checkpoint_dir:
+        model = load_task_model_weights(model, data_args.checkpoint_dir)
+
+    output_dir = data_args.output_dir or data_args.checkpoint_dir
+    if not output_dir:
+        raise ValueError("--output_dir is required when --checkpoint_dir is not provided")
+    os.makedirs(output_dir, exist_ok=True)
 
     trainer = Trainer(
         model=model,
         args=TrainingArguments(
-            output_dir=os.path.join(data_args.checkpoint_dir, "eval_logs"),
+            output_dir=os.path.join(output_dir, "eval_logs"),
             per_device_eval_batch_size=data_args.batch_size,
             remove_unused_columns=False,
             report_to="none",
@@ -174,7 +179,7 @@ def main():
     metrics = compute_metrics(prediction)
     metric_rows = [{"metric": key, "value": value} for key, value in metrics.items()]
     metrics_path = os.path.join(
-        data_args.checkpoint_dir,
+        output_dir,
         f"test_results_{data_args.split}_survival.csv",
     )
     pd.DataFrame(metric_rows).to_csv(metrics_path, index=False)
@@ -204,12 +209,12 @@ def main():
             }
         )
     raw_path = os.path.join(
-        data_args.checkpoint_dir,
+        output_dir,
         f"test_raw_predictions_{data_args.split}_survival.csv",
     )
     pd.DataFrame(rows).to_csv(raw_path, index=False)
     curves_path = os.path.join(
-        data_args.checkpoint_dir,
+        output_dir,
         f"test_daily_curves_{data_args.split}_survival.npz",
     )
     np.savez_compressed(

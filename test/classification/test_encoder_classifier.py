@@ -9,6 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from transformers import HfArgumentParser, set_seed
+from tqdm.auto import tqdm
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
@@ -60,6 +61,7 @@ class DataArguments:
     sample_info_test_path: Optional[str] = field(default=None)
     split_info_path: Optional[str] = field(default=None)
     checkpoint_dir: str = field(default="")
+    output_dir: Optional[str] = field(default=None)
     task_name: str = field(default="")
     embedding_cache: str = field(default="")
     type_vocab_file: str = field(default="data/type_vocab.json")
@@ -229,7 +231,8 @@ def main():
     model = EncoderClassifierModel(config=config, embedding_matrix=embedding_matrix, query_dim=query_dim)
     if model_args.pretrained_path:
         model = load_encoder_and_query_head_weights(model, model_args.pretrained_path)
-    model = load_task_model_weights(model, data_args.checkpoint_dir)
+    if data_args.checkpoint_dir:
+        model = load_task_model_weights(model, data_args.checkpoint_dir)
 
     dataset = build_eval_dataset(data_args)
     if is_multi_query_dataset:
@@ -253,6 +256,7 @@ def main():
             query_embeds=query_tensor_arg,
             query_embeddings_by_text=query_embeddings_by_text_arg,
             label_map=label_map,
+            include_metadata=data_args.dataset_name == "renji",
         )
         binary_output = task_info.get("task_type") == "binary_classification"
 
@@ -273,7 +277,15 @@ def main():
     all_probs = []
     all_metadata = []
     with torch.no_grad():
-        for batch in dataloader:
+        tqdm_position = int(os.environ.get("TQDM_POSITION", "0"))
+        for batch in tqdm(
+            dataloader,
+            desc=f"Evaluating {data_args.dataset_name}/{data_args.task_name}",
+            unit="batch",
+            position=tqdm_position,
+            dynamic_ncols=False,
+            leave=True,
+        ):
             metadata = batch.pop("metadata", None)
             labels = batch["labels"].cpu().numpy()
             batch = move_tensors_to_device(batch, device)
@@ -298,6 +310,8 @@ def main():
                 else:
                     all_logits.extend(outputs.logits.float().cpu().numpy().tolist())
                 all_probs.extend(probs.tolist())
+                if metadata is not None:
+                    all_metadata.extend(metadata)
 
     eval_pred = type("EvalPred", (), {"predictions": np.asarray(all_logits), "label_ids": np.asarray(all_labels)})
     metrics = compute_classification_metrics(eval_pred)
@@ -306,7 +320,11 @@ def main():
         print(f"{key}: {value:.4f}")
 
     output_task_name = data_args.task_name or data_args.dataset_name
-    output_file = os.path.join(data_args.checkpoint_dir, f"test_results_{output_task_name}.csv")
+    output_dir = data_args.output_dir or data_args.checkpoint_dir
+    if not output_dir:
+        raise ValueError("--output_dir is required when --checkpoint_dir is not provided")
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, f"test_results_{output_task_name}.csv")
     probs = np.asarray(all_probs)
     preds = probs.argmax(axis=-1)
     rows = []
