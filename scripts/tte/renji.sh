@@ -36,7 +36,7 @@ for task in "${tasks[@]}"; do
       --survival_task "${task}" \
       --data_dir "${data_dir}" \
       --embedding_cache "${embedding_cache}" \
-      --output_dir "${checkpoint_root}/${task_slug}" \
+      --output_dir "${checkpoint_root}/${task_slug}/full_tune" \
       --run_name "renji_${task_slug}" \
       --patient_subset_path "data/patients.json" \
       --tte_index_dir "${index_dir}" \
@@ -71,7 +71,7 @@ for task in "${tasks[@]}"; do
       --survival_task "${task}" \
       --data_dir "${data_dir}" \
       --embedding_cache "${embedding_cache}" \
-      --checkpoint_dir "${checkpoint_root}/${task_slug}" \
+      --checkpoint_dir "${checkpoint_root}/${task_slug}/full_tune" \
       --patient_subset_path "data/patients.json" \
       --tte_index_dir "${index_dir}" \
       --split test \

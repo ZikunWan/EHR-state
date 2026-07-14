@@ -22,7 +22,7 @@ tasks=(
   "renji_tte.sh:death"
 )
 
-gpu_ids=(${GPU_IDS:-0 1 2 3 4 5 6 7})
+gpu_ids=(0 1 2 3 4 5 6 7)
 free_gpus=("${gpu_ids[@]}")
 next_task=0
 failure=0
@@ -34,7 +34,7 @@ while ((next_task < ${#tasks[@]} || ${#pid_to_gpu[@]} > 0)); do
     free_gpus=("${free_gpus[@]:1}")
     IFS=: read -r script task <<< "${tasks[next_task]}"
     echo "===== Starting zero-shot ${script} task=${task} on GPU ${gpu} ====="
-    GPU_IDS="${gpu}" bash "${script_dir}/${script}" "${task}" &
+    bash "${script_dir}/${script}" "${task}" "${gpu}" &
     pid=$!
     pid_to_gpu["${pid}"]="${gpu}"
     ((next_task += 1))

@@ -7,7 +7,7 @@ TORCH_NCCL_DUMP_ON_TIMEOUT=1 \
 TORCH_NCCL_TRACE_BUFFER_SIZE=2000 \
 MIMIC_SKIP_SAMPLE_CACHE_CHECK=1 deepspeed --num_gpus=8 ./pretraining/pretrain.py \
     --deepspeed "./ds_config_zero2.json" \
-    --dataset mimic_iv eicu ehrshot \
+    --dataset mimic_iv eicu \
     --root_dir "/data/zikun_workspace/mimic-iv-3.1_tabular" \
     --eicu_root_dir "/data/zikun_workspace/eicu-crd" \
     --eicu_processed_dir "/data/zikun_workspace/eicu-crd/processed" \

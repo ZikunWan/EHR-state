@@ -3,6 +3,7 @@ set -euo pipefail
 source "$(dirname "$0")/../common/silent_info.sh"
 
 mode="${1:-train}"
+use_eval_dataset="${2:-true}"
 data_dir="/data/zikun_workspace/input/tables/ehrshot"
 index_dir="/data/zikun_workspace/input/tasks/classification/ehrshot"
 embedding_cache="/data/zikun_workspace/input/cache/embeddings/ehrshot/text_embeddings.pt"
@@ -10,6 +11,7 @@ checkpoint_root="/data/zikun_workspace/checkpoints/classification/ehrshot"
 query_cache_dir="/data/zikun_workspace/input/cache/query_embeddings/query_classifier/ehrshot"
 knowledge_encoder="/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/best.pt"
 base_model="/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT"
+pretrained_path="/data/zikun_workspace/checkpoints/pretraining/1B"
 tasks=(guo_los guo_readmission guo_icu lab_anemia lab_hyperkalemia lab_hyponatremia lab_hypoglycemia lab_thrombocytopenia new_acutemi new_celiac new_hyperlipidemia new_hypertension new_lupus new_pancan)
 
 for task in "${tasks[@]}"; do
@@ -22,16 +24,18 @@ for task in "${tasks[@]}"; do
       --val_info_path "${index_dir}/val/${task}.csv" \
       --max_train_samples 3000 \
       --max_eval_samples 1000 \
+      --use_eval_dataset "${use_eval_dataset}" \
       --task_name "${task}" \
       --embedding_cache "${embedding_cache}" \
-      --output_dir "${checkpoint_root}/${task}" \
+      --output_dir "${checkpoint_root}/${task}/full_tune" \
       --run_name "ehrshot_${task}" \
       --type_vocab_file "data/type_vocab.json" \
       --query_embedding_cache "${query_cache_dir}/${task}.pt" \
       --knowledge_encoder_path "${knowledge_encoder}" \
       --knowledge_encoder_base_model_path "${base_model}" \
+      --pretrained_path "${pretrained_path}" \
       --query_max_length 128 \
-      --max_table_len 16384 \
+      --max_table_len 4096 \
       --per_device_train_batch_size 16 \
       --per_device_eval_batch_size 32 \
       --eval_strategy steps \
@@ -50,7 +54,7 @@ for task in "${tasks[@]}"; do
       --dataset_name ehrshot \
       --data_dir "${data_dir}" \
       --sample_info_test_path "${index_dir}/test/${task}.csv" \
-      --checkpoint_dir "${checkpoint_root}/${task}" \
+      --checkpoint_dir "${checkpoint_root}/${task}/full_tune" \
       --task_name "${task}" \
       --embedding_cache "${embedding_cache}" \
       --type_vocab_file "data/type_vocab.json" \
@@ -61,7 +65,7 @@ for task in "${tasks[@]}"; do
       --max_table_len 16384 \
       --batch_size 64
   else
-    echo "Usage: $0 [train|eval]" >&2
+    echo "Usage: $0 [train|eval] [true|false]" >&2
     exit 2
   fi
 done

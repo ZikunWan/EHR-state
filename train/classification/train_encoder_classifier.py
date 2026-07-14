@@ -95,6 +95,7 @@ class DataArguments:
     lazy_mode: bool = field(default=True)
     trial_id: Optional[str] = field(default=None)
     patient_split_path: Optional[str] = field(default=None)
+    use_eval_dataset: bool = field(default=True)
 
 
 @dataclass
@@ -253,9 +254,15 @@ def main():
             query_key = f"{query_key}:trial:{data_args.trial_id}"
         query_texts = build_query_texts(query_key, task_info)
 
-    has_val = data_args.val_info_path is not None or data_args.val_sample_info_path is not None
+    has_val = data_args.use_eval_dataset and (
+        data_args.val_info_path is not None
+        or data_args.val_sample_info_path is not None
+    )
     if data_args.dataset_name in {"pds", "mimic_iv_cdm", "renji"}:
-        has_val = True
+        has_val = data_args.use_eval_dataset
+    if not data_args.use_eval_dataset:
+        training_args.eval_strategy = "no"
+        training_args.load_best_model_at_end = False
     if has_val and training_args.eval_strategy == "no":
         training_args.eval_strategy = "steps"
         if training_args.eval_steps is None:

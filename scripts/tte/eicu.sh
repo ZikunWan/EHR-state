@@ -30,7 +30,7 @@ for task in "${tasks[@]}"; do
       --max_train_samples 10000 \
       --task_name "${task}" \
       --embedding_cache "${embedding_cache}" \
-      --output_dir "${checkpoint_root}/${task}" \
+      --output_dir "${checkpoint_root}/${task}/full_tune" \
       --run_name "eicu_${task}" \
       --type_vocab_file "data/type_vocab.json" \
       --query_embedding_cache "${query_cache_dir}/${task}.pt" \
@@ -58,7 +58,7 @@ for task in "${tasks[@]}"; do
       --data_dir "${data_dir}" \
       --processed_dir "${processed_dir}" \
       --sample_info_test_path "${index_dir}/test/${task}.csv" \
-      --checkpoint_dir "${checkpoint_root}/${task}" \
+      --checkpoint_dir "${checkpoint_root}/${task}/full_tune" \
       --task_name "${task}" \
       --embedding_cache "${embedding_cache}" \
       --type_vocab_file "data/type_vocab.json" \

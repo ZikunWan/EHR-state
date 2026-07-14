@@ -4,10 +4,12 @@ source "$(dirname "$0")/../common/silent_info.sh"
 
 mode="${1:-train}"
 task_arg="${2:-all}"
+use_eval_dataset="${3:-true}"
 data_dir="/data/zikun_workspace/input/tables/renji/raw"
 embedding_cache="/data/zikun_workspace/input/cache/embeddings/renji/text_embeddings.pt"
 knowledge_encoder="/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/best.pt"
 base_model="/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT"
+pretrained_path="/data/zikun_workspace/checkpoints/pretraining/1B"
 tasks=(ALB ALP CR Glucose HB INR N_Percent PLT PT TP Uric_Acid WBC)
 
 if [[ "${task_arg}" != "all" ]]; then
@@ -16,13 +18,14 @@ fi
 
 run_train() {
   local task="$1"
-  local checkpoint_dir="/data/zikun_workspace/checkpoints/classification/renji/${task}"
+  local checkpoint_dir="/data/zikun_workspace/checkpoints/classification/renji/${task}/full_tune"
   local query_cache="/data/zikun_workspace/input/cache/query_embeddings/query_classifier/renji/${task}.pt"
   deepspeed --include localhost:4,5,6,7 train/classification/train_encoder_classifier.py \
     --deepspeed "ds_config_zero2.json" \
     --dataset_name renji \
     --data_dir "${data_dir}" \
     --task_name "${task}" \
+    --use_eval_dataset "${use_eval_dataset}" \
     --embedding_cache "${embedding_cache}" \
     --output_dir "${checkpoint_dir}" \
     --run_name "renji_${task}" \
@@ -30,8 +33,9 @@ run_train() {
     --query_embedding_cache "${query_cache}" \
     --knowledge_encoder_path "${knowledge_encoder}" \
     --knowledge_encoder_base_model_path "${base_model}" \
+    --pretrained_path "${pretrained_path}" \
     --query_max_length 128 \
-      --max_table_len 16384 \
+      --max_table_len 4096 \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 32 \
     --eval_strategy steps \
@@ -49,7 +53,7 @@ run_train() {
 
 run_eval() {
   local task="$1"
-  local checkpoint_dir="/data/zikun_workspace/checkpoints/classification/renji/${task}"
+  local checkpoint_dir="/data/zikun_workspace/checkpoints/classification/renji/${task}/full_tune"
   local query_cache="/data/zikun_workspace/input/cache/query_embeddings/query_classifier/renji/${task}.pt"
   CUDA_VISIBLE_DEVICES=0 python test/classification/test_encoder_classifier.py \
     --dataset_name renji \
@@ -76,6 +80,6 @@ elif [[ "${mode}" == "eval" ]]; then
     run_eval "${task}"
   done
 else
-  echo "Usage: $0 [train|eval] [all|ALB|ALP|CR|Glucose|HB|INR|N_Percent|PLT|PT|TP|Uric_Acid|WBC]" >&2
+  echo "Usage: $0 [train|eval] [all|TASK] [true|false]" >&2
   exit 2
 fi
