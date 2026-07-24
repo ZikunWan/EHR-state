@@ -6,7 +6,6 @@ TABLE_DIR="/data/zikun_workspace/input/tables/ehrshot"
 UTILS_DIR="/data/zikun_workspace/input/cache/ehrshot/utils"
 CLASSIFICATION_INDEX_DIR="/data/zikun_workspace/input/tasks/classification/ehrshot"
 SAMPLE_INFO_DIR="/data/zikun_workspace/input/cache/ehrshot/classification_sample_info"
-TTE_INDEX_DIR="/data/zikun_workspace/input/tasks/time_to_event/ehrshot/indices"
 PRETRAINING_INDEX_DIR="/data/zikun_workspace/input/tasks/pretraining/ehrshot/indices"
 
 python preprocess/ehrshot/1_generate_patient_ehr.py \
@@ -22,12 +21,3 @@ python preprocess/ehrshot/2_generate_sample_info.py \
   --output_dir "${SAMPLE_INFO_DIR}" \
   --classification_index_dir "${CLASSIFICATION_INDEX_DIR}" \
   --pretraining_index_dir "${PRETRAINING_INDEX_DIR}"
-
-python preprocess/ehrshot/generate_tte_task_index.py \
-  --root_dir "${TABLE_DIR}" \
-  --train_index_path "${SAMPLE_INFO_DIR}/ehrshot_train.csv" \
-  --val_index_path "${SAMPLE_INFO_DIR}/ehrshot_val.csv" \
-  --test_index_path "${SAMPLE_INFO_DIR}/ehrshot_test.csv" \
-  --output_dir "${TTE_INDEX_DIR}" \
-  --num_workers 32 \
-  --worker_chunksize 32

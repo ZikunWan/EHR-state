@@ -352,7 +352,7 @@ class EICUDataset(Dataset):
         label = sample["label"]
 
         measurement_df = self._cached_measurement_table(sample)
-        task_info = self.task_schema[self.task_name]
+        task_info = self.task_schema[str(sample["task_name"])]
         output_sample = {
             "idx": index,
             "input": "",

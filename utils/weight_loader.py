@@ -30,6 +30,16 @@ def _filter_state_dict(
     }
 
 
+def _prepare_numeric_embedding(model, state_dict):
+    key = "encoder.embedding.numeric_embedding.feature_keys"
+    feature_keys = state_dict.get(key)
+    if feature_keys is None or not hasattr(model, "encoder"):
+        return
+    numeric_embedding = getattr(model.encoder.embedding, "numeric_embedding", None)
+    if numeric_embedding is not None:
+        numeric_embedding.set_feature_keys(feature_keys.tolist())
+
+
 def load_encoder_weights(
     model,
     pretrained_path: str,
@@ -40,6 +50,7 @@ def load_encoder_weights(
         state_dict,
         include_prefixes=("encoder.", "adapter."),
     )
+    _prepare_numeric_embedding(model, encoder_state_dict)
     model.load_state_dict(encoder_state_dict, strict=False)
     if log_fn is not None:
         log_fn(f"Loaded {len(encoder_state_dict)} encoder tensors from {checkpoint_path}.")
@@ -60,11 +71,16 @@ def load_encoder_and_query_head_weights(
             remapped["query_head." + key.removeprefix("task_query_head.")] = value
         elif key.startswith("task_classifier."):
             remapped["classifier." + key.removeprefix("task_classifier.")] = value
+        elif key.startswith("sft.query_head."):
+            remapped["query_head." + key.removeprefix("sft.query_head.")] = value
+        elif key.startswith("sft.classifier."):
+            remapped["classifier." + key.removeprefix("sft.classifier.")] = value
         elif key.startswith("query_head."):
             remapped[key] = value
         elif key.startswith("classifier."):
             remapped[key] = value
 
+    _prepare_numeric_embedding(model, remapped)
     model.load_state_dict(remapped, strict=False)
     if log_fn is not None:
         log_fn(f"Loaded {len(remapped)} encoder/query-head tensors from {checkpoint_path}.")
@@ -113,10 +129,27 @@ def load_tte_pretrained_weights(
             remapped[f"survival_heads.{stage_id}.bias"] = bias
             offset += num_bins
 
+    _prepare_numeric_embedding(model, remapped)
     model.load_state_dict(remapped, strict=False)
     if log_fn is not None:
         log_fn(f"Loaded {len(remapped)} TTE tensors from {checkpoint_path}.")
     return model
+
+
+def load_daily_survival_head_weights(head, pretrained_path: str):
+    state_dict, checkpoint_path = _load_checkpoint_state_dict(pretrained_path)
+    weight = state_dict.get("task_survival_head.weight")
+    bias = state_dict.get("task_survival_head.bias")
+    if weight is None or bias is None:
+        raise KeyError(f"No task_survival_head weights found in {checkpoint_path}")
+    if head.out_features > weight.size(0):
+        raise ValueError(
+            f"Requested {head.out_features} survival bins, but checkpoint provides {weight.size(0)}"
+        )
+    with torch.no_grad():
+        head.weight.copy_(weight[: head.out_features])
+        head.bias.copy_(bias[: head.out_features])
+    return head
 
 
 def load_task_model_weights(
@@ -128,6 +161,7 @@ def load_task_model_weights(
 ):
     state_dict, resolved_checkpoint_path = _load_checkpoint_state_dict(checkpoint_path)
     task_state_dict = _filter_state_dict(state_dict)
+    _prepare_numeric_embedding(model, task_state_dict)
     model.load_state_dict(task_state_dict, strict=False)
     if log_fn is not None:
         log_fn(f"Loaded {len(task_state_dict)} model tensors from {resolved_checkpoint_path}.")

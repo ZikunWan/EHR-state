@@ -1,6 +1,7 @@
 import os 
 import sys
 import json
+import ast
 import hashlib
 import pickle
 import time
@@ -201,6 +202,7 @@ class MIMICIV(Dataset):
         itemid_representation="description",
         concept_map_dir=None,
         use_table_length_cache=True,
+        load_sample_info=True,
     ):
         random.seed(42)
         self.root_dir = root_dir
@@ -242,17 +244,17 @@ class MIMICIV(Dataset):
             concept_map_dir=self.concept_map_dir,
         )
 
-        if self.local_rank in (-1, 0):
+        if load_sample_info and self.local_rank in (-1, 0):
             print(f"Loading sample info from {self.sample_info_path}")
         read_nrows = None
         if self.max_samples is not None and (not shuffle) and (not self.use_table_length_cache):
             read_nrows = self.max_samples
         df = pd.read_csv(
             self.sample_info_path,
-            nrows=read_nrows,
+            nrows=read_nrows if load_sample_info else 0,
         )
         self.sample_info = df.to_dict(orient = 'records')
-        if self.local_rank in (-1, 0):
+        if load_sample_info and self.local_rank in (-1, 0):
             print(f"Loaded {len(self.sample_info)} samples from CSV")
 
         task_values = []
@@ -861,14 +863,38 @@ class MIMICIV(Dataset):
         return data_rows
 
     def make_candidates(self, task_name, output):
+        if isinstance(output, str) and output.strip().startswith("["):
+            output = ast.literal_eval(output)
+        if not isinstance(output, list):
+            output = [str(output)]
+
         if task_name not in self.similar_item:
             candidate_file = os.path.join(self.similar_item_dir, f"{task_name}.csv")
             if not os.path.exists(candidate_file):
-                return None
-            candidate_df = pd.read_csv(candidate_file)
-            self.similar_item[task_name] = {row[0]: list(row[1:]) for _, row in candidate_df.iterrows()}
+                event_dir = {"diagnosis": "ed", "diagnoses_icd": "hosp"}.get(task_name)
+                if event_dir is None:
+                    return None
+                vocabulary_file = os.path.join(
+                    self.origin_data_dir, event_dir, "d_icd_diagnoses.csv"
+                )
+                candidate_df = pd.read_csv(vocabulary_file, usecols=["long_title"])
+                self.similar_item[task_name] = candidate_df["long_title"].dropna().astype(str).unique().tolist()
+            else:
+                candidate_df = pd.read_csv(candidate_file)
+                self.similar_item[task_name] = {row[0]: list(row[1:]) for _, row in candidate_df.iterrows()}
 
         total_candidate = self.similar_item[task_name]
+        if isinstance(total_candidate, list):
+            positive_set = set(output)
+            sampled = random.sample(
+                total_candidate,
+                min(len(total_candidate), 100 + len(positive_set)),
+            )
+            negatives = [item for item in sampled if item not in positive_set][:100]
+            candidate_list = list(positive_set) + negatives
+            random.shuffle(candidate_list)
+            return candidate_list
+
         if len(total_candidate) > 100:
             candidate_list = []
             for label in output:

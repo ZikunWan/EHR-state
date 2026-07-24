@@ -12,8 +12,8 @@ checkpoint_root="/data/zikun_workspace/checkpoints/classification/eicu"
 query_cache_dir="/data/zikun_workspace/input/cache/query_embeddings/query_classifier/eicu"
 knowledge_encoder="/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/best.pt"
 base_model="/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT"
-pretrained_path="/data/zikun_workspace/checkpoints/pretraining/1B"
-tasks=(mortality long_term_mortality readmission los_3day los_7day final_acuity imminent_discharge creatinine bilirubin platelets wbc)
+pretrained_path="/data/zikun_workspace/checkpoints/pretraining/550M"
+tasks=(mortality long_term_mortality readmission los_3day los_7day final_acuity imminent_discharge diagnosis creatinine bilirubin platelets wbc)
 
 for task in "${tasks[@]}"; do
   if [[ "${mode}" == "train" ]]; then

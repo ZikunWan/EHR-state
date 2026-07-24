@@ -8,12 +8,12 @@ class _BaseTableEncoderConfig(PretrainedConfig):
         self,
         # Core dimensions for input text embeddings and transformer hidden states.
         text_dim: int = 768,
-        dim: int = 1536,
-        depth: int = 40,
-        heads: int = 24,
-        kv_heads: Optional[int] = 8,
+        dim: int = 1280,
+        depth: int = 28,
+        heads: int = 20,
+        kv_heads: Optional[int] = None,
         dim_head: int = 64,
-        mlp_dim: int = 6144,
+        mlp_dim: int = 5120,
         dropout: float = 0.0,
 
         # Output adapter: allocate at most max_queries, about one query per tokens_per_query rows.
@@ -27,16 +27,25 @@ class _BaseTableEncoderConfig(PretrainedConfig):
         # Recompute transformer blocks during backward to reduce activation memory.
         activation_checkpointing: bool = False,
 
-        # Table feature settings for numeric value Fourier features and type embeddings.
-        fourier_scales: Optional[List[float]] = None,
+        # PLR(lite) numeric embeddings and type embeddings.
+        numeric_feature_keys: Optional[List[int]] = None,
+        numeric_embedding_dim: int = 24,
+        numeric_n_frequencies: int = 48,
+        numeric_frequency_init_scale: float = 0.01,
         type_vocab_size: int = 11,
 
         **kwargs,
     ):
         super().__init__(**kwargs)
 
-        if fourier_scales is None:
-            fourier_scales = [0.1, 1.0, 10.0, 100.0]
+        if numeric_feature_keys is None:
+            numeric_feature_keys = []
+        if numeric_embedding_dim <= 0:
+            raise ValueError("numeric_embedding_dim must be positive")
+        if numeric_n_frequencies <= 0:
+            raise ValueError("numeric_n_frequencies must be positive")
+        if numeric_frequency_init_scale <= 0:
+            raise ValueError("numeric_frequency_init_scale must be positive")
         if max_queries <= 0:
             raise ValueError("max_queries must be positive")
         if tokens_per_query <= 0:
@@ -68,7 +77,10 @@ class _BaseTableEncoderConfig(PretrainedConfig):
         self.is_causal = is_causal
         self.activation_checkpointing = activation_checkpointing
 
-        self.fourier_scales = fourier_scales
+        self.numeric_feature_keys = numeric_feature_keys
+        self.numeric_embedding_dim = numeric_embedding_dim
+        self.numeric_n_frequencies = numeric_n_frequencies
+        self.numeric_frequency_init_scale = numeric_frequency_init_scale
         self.type_vocab_size = type_vocab_size
 
 

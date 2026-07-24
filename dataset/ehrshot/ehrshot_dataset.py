@@ -5,7 +5,6 @@ import time
 from torch.utils.data import Dataset
 from functools import *
 import pandas as pd
-import random
 import multiprocessing as mp
 import warnings
 warnings.filterwarnings("ignore", message=".*DataFrameGroupBy.apply operated on the grouping columns.*")
@@ -258,8 +257,6 @@ class EHRSHOTDataset(Dataset):
         task_name=None,
         use_table_length_cache=False,
     ):  
-        random.seed(42)
-        
         self.task_schema = get_task_info()
         self.root_dir = root_dir
         self.ehr_dir = os.path.join(root_dir, "patients")
@@ -583,9 +580,8 @@ class EHRSHOTDataset(Dataset):
         task_info["task_type"] = self.task_schema[task_name]["task_type"]
         task_info["metric"] = self.task_schema[task_name]["metric"]
         raw_label = sample['label']
-        
-        # EHRSHOT classification indices store all labels as integer values:
-        # binary tasks use 0/1 and multi-class lab tasks use integer class IDs.
+
+        # Classification indices store binary and multi-class labels as IDs.
         task_info["label"] = int(raw_label)
         
         output_sample = {

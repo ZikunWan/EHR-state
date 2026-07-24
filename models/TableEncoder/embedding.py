@@ -22,23 +22,67 @@ class TimeEncoding(nn.Module):
         return pe
 
 
-class FourierFeatures(nn.Module):
-    def __init__(self, fourier_scales=[0.1, 1., 10., 100.]):
-        super(FourierFeatures, self).__init__()
-        assert len(fourier_scales) > 0
+class PeriodicEmbeddingsLite(nn.Module):
+    """PLR(lite) embeddings with per-(item, unit) trainable frequencies."""
 
-        _omega = 1 / (2 ** torch.tensor(fourier_scales, dtype=torch.float32))
-        self.register_buffer('omega', _omega)
+    def __init__(
+        self,
+        feature_keys,
+        d_embedding: int = 24,
+        n_frequencies: int = 48,
+        frequency_init_scale: float = 0.01,
+    ):
+        super().__init__()
+        if d_embedding <= 0 or n_frequencies <= 0 or frequency_init_scale <= 0:
+            raise ValueError("PLR(lite) dimensions and initialization scale must be positive")
+        self.n_frequencies = n_frequencies
+        self.frequency_init_scale = frequency_init_scale
+        self.register_buffer("feature_keys", torch.empty(0, dtype=torch.long))
+        self.frequencies = nn.Parameter(torch.empty(1, n_frequencies))
+        self.linear = nn.Linear(2 * n_frequencies, d_embedding)
+        self.set_feature_keys(feature_keys)
 
-        self.output_dim = 2 * len(self.omega)
+    @staticmethod
+    def pair_keys(item_ids: torch.Tensor, unit_ids: torch.Tensor) -> torch.Tensor:
+        return item_ids.long() * (1 << 32) + unit_ids.long()
 
-    def forward(self, x):
-        # x: [batch_size, seq_len]
-        x = torch.einsum('bs,d -> bsd', x, self.omega.to(dtype=x.dtype))
-        x_sin = torch.sin(x)
-        x_cos = torch.cos(x)
-        res = torch.cat((x_sin, x_cos), -1)
-        return res
+    def set_feature_keys(self, feature_keys) -> None:
+        keys = torch.as_tensor(feature_keys, dtype=torch.long, device=self.feature_keys.device)
+        if keys.numel() and (keys[1:] <= keys[:-1]).any():
+            raise ValueError("numeric feature keys must be strictly increasing")
+        self.feature_keys = keys
+        frequencies = torch.empty(
+            keys.numel() + 1,
+            self.n_frequencies,
+            device=self.frequencies.device,
+            dtype=self.frequencies.dtype,
+        )
+        bound = 3.0 * self.frequency_init_scale
+        nn.init.trunc_normal_(
+            frequencies,
+            mean=0.0,
+            std=self.frequency_init_scale,
+            a=-bound,
+            b=bound,
+        )
+        self.frequencies = nn.Parameter(frequencies)
+
+    def feature_ids(self, item_ids: torch.Tensor, unit_ids: torch.Tensor) -> torch.Tensor:
+        pair_keys = self.pair_keys(item_ids, unit_ids)
+        if self.feature_keys.numel() == 0:
+            return torch.zeros_like(pair_keys)
+        positions = torch.searchsorted(self.feature_keys, pair_keys)
+        valid = positions < self.feature_keys.numel()
+        matched = valid & (
+            self.feature_keys[positions.clamp_max(self.feature_keys.numel() - 1)] == pair_keys
+        )
+        return torch.where(matched, positions + 1, torch.zeros_like(positions))
+
+    def forward(self, values: torch.Tensor, feature_ids: torch.Tensor) -> torch.Tensor:
+        frequencies = self.frequencies[feature_ids]
+        phases = 2.0 * math.pi * values.unsqueeze(-1) * frequencies
+        periodic = torch.cat((torch.cos(phases), torch.sin(phases)), dim=-1)
+        return torch.relu(self.linear(periodic))
 
 
 class LongTableEmbedding(nn.Module):
@@ -48,13 +92,16 @@ class LongTableEmbedding(nn.Module):
     def __init__(self, text_dim: int = 768,
                  dim: int = 768,
                  type_vocab_size: int = 24,
-                 fourier_scales=[0.1, 1., 10., 100.]):
+                 numeric_feature_keys=None,
+                 numeric_embedding_dim: int = 24,
+                 numeric_n_frequencies: int = 48,
+                 numeric_frequency_init_scale: float = 0.01):
         """
         Args:
             text_dim: Dimension of pre-computed text embeddings
             dim: Model hidden dimension
             type_vocab_size: vocab size for type category (e.g. Lab, Vital, Med)
-            fourier_scales: scales for numeric fourier features
+            numeric_feature_keys: sorted keys identifying observed (item, unit) pairs
         """
         super().__init__()
         self.text_dim = text_dim
@@ -68,9 +115,14 @@ class LongTableEmbedding(nn.Module):
         # Type Category Embedding
         self.type_embedding = nn.Embedding(type_vocab_size, dim)
         
-        # Numeric Value Fourier Features + Projection
-        self.fourier_feat = FourierFeatures(fourier_scales)
-        self.numeric_proj = nn.Linear(self.fourier_feat.output_dim, dim)
+        # PLR(lite): per-feature frequencies followed by a shared projection.
+        self.numeric_embedding = PeriodicEmbeddingsLite(
+            numeric_feature_keys or [],
+            d_embedding=numeric_embedding_dim,
+            n_frequencies=numeric_n_frequencies,
+            frequency_init_scale=numeric_frequency_init_scale,
+        )
+        self.numeric_proj = nn.Linear(numeric_embedding_dim, dim)
         
         # Time Encoding
         self.time_enc = TimeEncoding(dim)
@@ -82,6 +134,7 @@ class LongTableEmbedding(nn.Module):
                 times: torch.Tensor,
                 numeric_values: torch.Tensor,
                 numeric_mask: torch.Tensor,
+                numeric_feature_ids: torch.Tensor,
                 type_ids: Optional[torch.Tensor] = None):
         """
         Forward pass with pre-computed embeddings.
@@ -110,8 +163,8 @@ class LongTableEmbedding(nn.Module):
         # Text path
         val_text_proj = self.value_text_proj(value_emb)  # [batch_size, seq_len, dim]
         
-        # Numeric path (Fourier Features -> Linear Projection)
-        val_numeric = self.fourier_feat(numeric_values) # [batch_size, seq_len, fourier_dim]
+        # Numeric path (PLR(lite) -> model-dimension projection)
+        val_numeric = self.numeric_embedding(numeric_values, numeric_feature_ids)
         val_numeric = self.numeric_proj(val_numeric) # [batch_size, seq_len, dim]
         
         # Combine: use numeric where mask=1, else use text

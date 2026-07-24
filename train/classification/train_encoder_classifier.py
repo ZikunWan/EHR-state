@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
-from transformers import EarlyStoppingCallback, HfArgumentParser, Trainer, TrainingArguments, set_seed
+from transformers import EarlyStoppingCallback, HfArgumentParser, TrainingArguments, set_seed
 from transformers.utils import logging as hf_logging
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,7 +26,6 @@ from dataset.renji.renji_dataset import RenjiDataset
 from dataset.renji.task_info import get_task_info as get_renji_task_info
 from models.TableEncoder.config import LongTableEncoder1DConfig
 from models.encoder_classifier import EncoderClassifierModel
-from outdated import task_query_classification as tqc
 from utils.collate import create_multi_query_classifier_collate_fn, create_query_classifier_collate_fn
 from utils.load_embedding import (
     build_embedding_matrix,
@@ -36,11 +35,17 @@ from utils.load_embedding import (
     get_special_token_indices,
     load_embedding_cache,
 )
-from utils.metrics import compute_classification_metrics
+from utils.metrics import (
+    compute_binary_metrics_at_optimal_f1,
+    compute_classification_metrics,
+    find_optimal_binary_threshold,
+)
+from utils.training_batching import TokenBudgetTrainer
 from utils.weight_loader import apply_fine_tune_mode, load_encoder_and_query_head_weights
 
 
 RENJI_ACTIVE_POINTS = ["day30", "day180", "day365"]
+BINARY_FORMAT_QUERY_KEY = "__format_binary_classification__"
 
 
 def rank0_print(*args, **kwargs):
@@ -69,12 +74,14 @@ def quiet_non_main_process_logs():
 class ModelArguments:
     pretrained_path: Optional[str] = field(default=None)
     fine_tune_mode: str = field(default="full_fine_tune")
+    classifier_dropout: float = field(default=0.0)
 
 
 @dataclass
 class DataArguments:
     dataset_name: str = field(default="eicu")
     max_table_len: int = field(default=16384)
+    activation_checkpointing: bool = field(default=False)
     data_dir: str = field(default="")
     processed_dir: Optional[str] = field(default=None)
     train_info_path: Optional[str] = field(default=None)
@@ -85,6 +92,7 @@ class DataArguments:
     embedding_cache: str = field(default="")
     type_vocab_file: str = field(default="data/type_vocab.json")
     query_embedding_cache: str = field(default="/data/zikun_workspace/input/cache/embeddings/query_classifier/task_query_embeddings.pt")
+    format_query_embedding_cache: str = field(default="/data/zikun_workspace/input/cache/query_embeddings/pretraining/task_query_knowledge_embeddings.pt")
     knowledge_encoder_path: str = field(default="/data/zikun_workspace/checkpoints/pretraining/knowledge_encoder/best.pt")
     knowledge_encoder_base_model_path: str = field(default="/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT")
     query_max_length: int = field(default=512)
@@ -92,6 +100,8 @@ class DataArguments:
     max_eval_samples: Optional[int] = field(default=None)
     max_train_patients: Optional[int] = field(default=None)
     max_eval_patients: Optional[int] = field(default=None)
+    train_token_budget: Optional[int] = field(default=None)
+    max_dynamic_train_batch_size: int = field(default=128)
     lazy_mode: bool = field(default=True)
     trial_id: Optional[str] = field(default=None)
     patient_split_path: Optional[str] = field(default=None)
@@ -207,15 +217,127 @@ def build_dataset(data_args: DataArguments, split: str):
 
 def build_query_texts(query_key: str, task_info: dict) -> dict[str, str]:
     if task_info.get("task_type") == "binary_classification":
-        return {query_key: tqc.class_query_text(query_key, task_info, "yes")}
-    return tqc.build_class_query_texts(query_key, task_info)
+        return {binary_task_query_key(query_key): str(task_info["instruction"])}
+
+    labels = class_labels_for_task(task_info)
+    prompts = task_info.get("candidate_prompts", {})
+    return {
+        class_query_key(query_key, label): str(prompts.get(label, label))
+        for label in labels
+    }
+
+
+def class_labels_for_task(task_info: dict) -> list[str]:
+    if "candidate" in task_info:
+        labels = [str(label) for label in task_info["candidate"]]
+    else:
+        labels = [str(index) for index in range(int(task_info["num_classes"]))]
+    if len(labels) != int(task_info["num_classes"]):
+        raise ValueError(
+            "Task candidate count does not match num_classes: "
+            f"{len(labels)} != {task_info['num_classes']}"
+        )
+    return labels
+
+
+def class_query_key(query_key: str, label: str) -> str:
+    return f"{query_key}:class_query:{label}"
+
+
+def binary_task_query_key(query_key: str) -> str:
+    return f"{query_key}:task_query"
+
+
+def add_binary_format_query_embedding(
+    embeddings_by_text: dict[str, torch.Tensor],
+    cache_path: str,
+    query_dim: int,
+    knowledge_encoder_path: Optional[str] = None,
+    knowledge_encoder_base_model_path: Optional[str] = None,
+) -> dict[str, torch.Tensor]:
+    cache = torch.load(cache_path, map_location="cpu", weights_only=False)
+    cached_embeddings = cache.get("embeddings", {})
+    if BINARY_FORMAT_QUERY_KEY not in cached_embeddings:
+        raise KeyError(
+            f"Missing {BINARY_FORMAT_QUERY_KEY!r} in pretraining query cache: {cache_path}"
+        )
+    for metadata_key, expected_path in (
+        ("model_path", knowledge_encoder_path),
+        ("base_model_path", knowledge_encoder_base_model_path),
+    ):
+        cached_path = cache.get(metadata_key)
+        if cached_path and expected_path and os.path.realpath(cached_path) != os.path.realpath(expected_path):
+            raise ValueError(
+                f"Pretraining format-query cache {metadata_key} mismatch: "
+                f"{cached_path!r} != {expected_path!r}"
+            )
+    format_embedding = cached_embeddings[BINARY_FORMAT_QUERY_KEY].float()
+    if format_embedding.numel() != query_dim:
+        raise ValueError(
+            "Binary format-query dimension does not match the task-query dimension: "
+            f"{format_embedding.numel()} != {query_dim}"
+        )
+    result = dict(embeddings_by_text)
+    result[BINARY_FORMAT_QUERY_KEY] = format_embedding
+    return result
+
+
+def compute_binary_pos_weight(dataset) -> float:
+    labels = [int(float(sample["label"])) for sample in dataset.sample_info]
+    unexpected = sorted(set(labels) - {0, 1})
+    if unexpected:
+        raise ValueError(f"Binary task contains non-binary labels: {unexpected}")
+    positives = sum(label == 1 for label in labels)
+    negatives = sum(label == 0 for label in labels)
+    if positives == 0 or negatives == 0:
+        raise ValueError(
+            "Cannot compute pos_weight without both classes: "
+            f"negative={negatives}, positive={positives}"
+        )
+    return negatives / positives
+
+
+def build_classifier_config(
+    text_dim: int,
+    type_vocab_size: int,
+    query_dim: int,
+    num_classes: int,
+    problem_type: str,
+    max_table_len: Optional[int],
+    config_path: Optional[str] = None,
+    activation_checkpointing: bool = False,
+    pos_weight: Optional[float] = None,
+    classifier_dropout: Optional[float] = None,
+) -> LongTableEncoder1DConfig:
+    if config_path:
+        config = LongTableEncoder1DConfig.from_pretrained(config_path)
+    else:
+        config = LongTableEncoder1DConfig()
+    config.text_dim = text_dim
+    config.type_vocab_size = type_vocab_size
+    config.dim_out = query_dim
+    config.num_classes = num_classes
+    config.problem_type = problem_type
+    config.activation_checkpointing = activation_checkpointing
+    if classifier_dropout is not None:
+        config.classifier_dropout = float(classifier_dropout)
+    elif not hasattr(config, "classifier_dropout"):
+        config.classifier_dropout = 0.0
+    if pos_weight is not None:
+        config.pos_weight = float(pos_weight)
+    elif not hasattr(config, "pos_weight"):
+        config.pos_weight = 1.0
+    if max_table_len is not None:
+        config.max_table_len = max_table_len
+    return config
 
 
 def build_query_tensor(query_key: str, task_info: dict, embeddings_by_text: dict[str, torch.Tensor]):
     if task_info.get("task_type") == "binary_classification":
-        return embeddings_by_text[query_key].float(), None
-    labels = tqc.class_labels_for_task(task_info)
-    keys = [tqc.class_query_key(query_key, label) for label in labels]
+        keys = [binary_task_query_key(query_key), BINARY_FORMAT_QUERY_KEY]
+        return torch.stack([embeddings_by_text[key] for key in keys]).float(), None
+    labels = class_labels_for_task(task_info)
+    keys = [class_query_key(query_key, label) for label in labels]
     return torch.stack([embeddings_by_text[key] for key in keys]).float(), {label: idx for idx, label in enumerate(labels)}
 
 
@@ -268,7 +390,7 @@ def main():
         if training_args.eval_steps is None:
             training_args.eval_steps = 100
     if training_args.eval_strategy != "no":
-        training_args.metric_for_best_model = "auroc" if task_info.get("task_type") == "binary_classification" else "accuracy"
+        training_args.metric_for_best_model = task_info["metric"]
         training_args.greater_is_better = True
         training_args.load_best_model_at_end = True
 
@@ -290,16 +412,40 @@ def main():
         knowledge_encoder_path=data_args.knowledge_encoder_path,
         knowledge_encoder_base_model_path=data_args.knowledge_encoder_base_model_path,
     )
+    if task_info.get("task_type") == "binary_classification":
+        embeddings_by_text = add_binary_format_query_embedding(
+            embeddings_by_text,
+            cache_path=data_args.format_query_embedding_cache,
+            query_dim=query_dim,
+            knowledge_encoder_path=data_args.knowledge_encoder_path,
+            knowledge_encoder_base_model_path=data_args.knowledge_encoder_base_model_path,
+        )
     if not is_multi_query_dataset and data_args.dataset_name != "renji":
         query_tensor, label_map = build_query_tensor(query_key, task_info, embeddings_by_text)
 
-    config = LongTableEncoder1DConfig(
+    pos_weight = None
+    if task_info.get("task_type") == "binary_classification":
+        pos_weight = compute_binary_pos_weight(train_dataset)
+        rank0_print(
+            f"Binary pos_weight={pos_weight:.6f} "
+            f"(computed as negative_count / positive_count from {len(train_dataset)} training samples)"
+        )
+
+    config = build_classifier_config(
         text_dim=text_dim,
         type_vocab_size=len(type_vocab),
         max_table_len=data_args.max_table_len,
-        dim_out=query_dim,
+        activation_checkpointing=data_args.activation_checkpointing,
+        query_dim=query_dim,
         num_classes=1 if task_info.get("task_type") == "binary_classification" else int(task_info["num_classes"]),
-        problem_type="single_label_classification",
+        problem_type=(
+            "multi_label_classification"
+            if task_info.get("task_type") == "multi_label_classification"
+            else "single_label_classification"
+        ),
+        config_path=model_args.pretrained_path,
+        pos_weight=pos_weight,
+        classifier_dropout=model_args.classifier_dropout,
     )
     model = EncoderClassifierModel(config=config, embedding_matrix=embedding_matrix, query_dim=query_dim)
     if model_args.pretrained_path:
@@ -331,17 +477,51 @@ def main():
     if training_args.early_stopping_patience > 0 and training_args.eval_strategy != "no":
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=training_args.early_stopping_patience))
 
-    trainer = Trainer(
+    validation_metrics_fn = compute_classification_metrics
+    if task_info.get("task_type") == "binary_classification":
+        validation_metrics_fn = compute_binary_metrics_at_optimal_f1
+
+    trainer = TokenBudgetTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=collate_fn,
-        compute_metrics=compute_classification_metrics if val_dataset is not None else None,
+        compute_metrics=validation_metrics_fn if val_dataset is not None else None,
         callbacks=callbacks if callbacks else None,
+        train_token_budget=data_args.train_token_budget,
+        max_dynamic_batch_size=data_args.max_dynamic_train_batch_size,
+        max_table_len=data_args.max_table_len,
     )
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model()
+    if val_dataset is not None and task_info.get("task_type") == "binary_classification":
+        prediction_output = trainer.predict(val_dataset)
+        logits = prediction_output.predictions
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        probabilities = torch.sigmoid(torch.as_tensor(logits).reshape(-1).float()).numpy()
+        threshold, validation_f1 = find_optimal_binary_threshold(
+            prediction_output.label_ids,
+            probabilities,
+        )
+        if trainer.is_world_process_zero():
+            threshold_path = os.path.join(training_args.output_dir, "decision_threshold.json")
+            with open(threshold_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "threshold": threshold,
+                        "validation_f1": validation_f1,
+                        "selection": "maximum_validation_f1",
+                    },
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                )
+            rank0_print(
+                f"Saved validation-selected binary threshold {threshold:.6f} "
+                f"(F1={validation_f1:.6f}) to {threshold_path}."
+            )
 
 
 if __name__ == "__main__":

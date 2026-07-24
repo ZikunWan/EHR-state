@@ -1,832 +1,846 @@
 import bisect
+import ast
+import csv
 import json
 import math
 import os
-import shutil
 import sys
+from collections import defaultdict
 from dataclasses import dataclass, field
-from functools import partial
-from typing import Dict, List, Optional
+from glob import glob
+from typing import Optional
 
 import numpy as np
+import pandas as pd
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Sampler
-from accelerate.utils import DistributedType
-from tqdm.auto import tqdm
-from transformers import (
-    EarlyStoppingCallback,
-    EvalPrediction,
-    HfArgumentParser,
-    PreTrainedModel,
-    Trainer,
-    TrainerCallback,
-    TrainingArguments,
-    set_seed,
-)
-from transformers.trainer_utils import seed_worker
+from safetensors.torch import load_file
+from torch.utils.data import Dataset, SequentialSampler, Subset
+from transformers import HfArgumentParser, PreTrainedModel, Trainer, TrainingArguments, set_seed
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
+from dataset.eicu.eicu_dataset import EICUDataset
+from dataset.mimic.mimic_dataset import MIMICIV
 from models.TableEncoder.adapter import QFormerAdapter
 from models.TableEncoder.config import LongTableEncoder1DConfig
 from models.TableEncoder.encoder import LongTableEncoder1D
-from models.encoder_classifier import QueryClassificationHead, query_classification_loss
 from models.next_token_decoder import NextTokenPredictionDecoder
-from models.query_attention import QueryCrossAttentionHead
-from utils.metrics import compute_classification_metrics
+from models.phenotype_metric_model import PhenotypeMetricModel
+from pretraining.ntp import SlidingWindowDataset
+from pretraining.eval_metrics import EvaluationAccumulator
+from pretraining.pml import (
+    PhenotypePairDataset,
+    load_balanced_phenotype_specs,
+)
+from pretraining.runtime_index import ensure_runtime_index, load_ntp_windows
+from pretraining.sft import (
+    SFTDataset,
+    SFTObjective,
+    TASK_TYPE_BINARY,
+    TASK_TYPE_CANDIDATE_DIAGNOSIS,
+    TASK_TYPE_MULTILABEL,
+    TASK_TYPE_MULTICLASS,
+    TASK_TYPE_TTE,
+    all_task_info,
+    build_task_query_bank,
+    task_info_for,
+    task_key,
+)
+from utils.collate import build_table_token_tensors
 
 
-import outdated.phenotype_metric_learning as pml
-import outdated.task_query_classification as tqc
+SEQUENCE_FIELDS = (
+    "item_ids",
+    "unit_ids",
+    "value_text_ids",
+    "times",
+    "numeric_values",
+    "numeric_mask",
+    "type_ids",
+)
+INTEGER_FIELDS = {"item_ids", "unit_ids", "value_text_ids", "type_ids"}
+PRETRAINING_OBJECTIVES = ("ntp", "pml", "sft")
 
 
-@dataclass
-class DataArguments:
-    dataset: List[str] = field(
-        default_factory=lambda: ["mimic_iv", "eicu", "ehrshot"]
-    )
-    root_dir: str = field(
-        default="/data/zikun_workspace/mimic-iv-3.1_tabular"
-    )
-    eicu_root_dir: str = field(default="/data/zikun_workspace/eicu-crd")
-    eicu_processed_dir: str = field(
-        default="/data/zikun_workspace/eicu-crd/processed"
-    )
-    ehrshot_root_dir: str = field(default="/data/zikun_workspace/input/tables/ehrshot")
-    table_text_embedding: List[str] = field(
-        default_factory=lambda: [
-            "/data/zikun_workspace/input/cache/embeddings/mimic_iv/"
-            "text_embeddings.pt"
-        ]
-    )
-    eicu_table_text_embedding: List[str] = field(
-        default_factory=lambda: [
-            "/data/zikun_workspace/input/cache/embeddings/eicu/"
-            "text_embeddings.pt"
-        ]
-    )
-    ehrshot_table_text_embedding: List[str] = field(
-        default_factory=lambda: [
-            "/data/zikun_workspace/input/cache/embeddings/ehrshot/"
-            "text_embeddings.pt"
-        ]
-    )
-    merged_table_embedding_cache: Optional[str] = field(
-        default="/data/zikun_workspace/input/cache/embeddings/merged_table_embeddings.pt"
-    )
-    type_vocab_file: str = field(
-        default="/data/zikun_workspace/code/data/type_vocab.json"
-    )
-
-    task_query_embedding_cache: str = field(
-        default="/data/zikun_workspace/input/cache/query_embeddings/pretraining/"
-        "task_query_knowledge_embeddings.pt"
-    )
-
-    phenotype_spec_path: str = field(
-        default="/data/zikun_workspace/input/cache/pretraining/phenotype_metric_learning/"
-        "phenotype_query_specs.json"
-    )
-    phenotype_query_embedding_cache: str = field(
-        default="/data/zikun_workspace/input/cache/query_embeddings/pretraining/"
-        "phenotype_query_knowledge_embeddings.pt"
-    )
-    pretraining_input_dir: str = field(
-        default="/data/zikun_workspace/input/cache/pretraining/ehr_encoder/inputs"
-    )
-    unified_preprocessed_input_dir: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Deprecated alias for --pretraining_input_dir. "
-                "Use input/cache/pretraining/ehr_encoder/inputs."
-            )
-        },
-    )
-    knowledge_encoder_path: str = field(
-        default="/data/zikun_workspace/checkpoints/pretraining/"
-        "knowledge_encoder/clinicalBERT_after_stage2/best.pt"
-    )
-    knowledge_encoder_base_model_path: str = field(
-        default="/data/model_weights_public/emilyalsentzer/Bio_ClinicalBERT"
-    )
-    query_max_length: int = field(default=128)
-    query_embedding_batch_size: int = field(default=256)
-    max_table_len: Optional[int] = field(default=16384)
-    min_table_rows: int = field(default=2)
+def rank0_print(*args, **kwargs):
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(*args, **kwargs)
 
 
-@dataclass
-class PretrainingArguments(TrainingArguments):
-    # Keep the Accelerate data-dispatch policy with the training code instead
-    # of requiring a separate JSON file. CLI ``--accelerator_config`` can still
-    # override this default when a different policy is needed.
-    accelerator_config: dict = field(
-        default_factory=lambda: {
-            "split_batches": True,
-            "even_batches": False,
-            "dispatch_batches": False,
+def normalize_objectives(objectives) -> tuple[str, ...]:
+    normalized = tuple(dict.fromkeys(str(value).strip().lower() for value in objectives))
+    invalid = sorted(set(normalized) - set(PRETRAINING_OBJECTIVES))
+    if invalid:
+        raise ValueError(f"Unsupported pretraining objectives: {invalid}")
+    if len(normalized) != 1 and set(normalized) != set(PRETRAINING_OBJECTIVES):
+        raise ValueError(
+            "--objectives must select one objective or all three objectives."
+        )
+    return normalized
+
+
+def load_initialization_weights(model, checkpoint_path: str):
+    resolved_path = checkpoint_path
+    if os.path.isdir(resolved_path):
+        resolved_path = next(
+            (
+                os.path.join(resolved_path, filename)
+                for filename in ("model.safetensors", "pytorch_model.bin")
+                if os.path.exists(os.path.join(resolved_path, filename))
+            ),
+            None,
+        )
+    if resolved_path is None or not os.path.isfile(resolved_path):
+        raise FileNotFoundError(f"No model checkpoint found at {checkpoint_path}")
+    if resolved_path.endswith(".safetensors"):
+        state_dict = load_file(resolved_path)
+    else:
+        checkpoint = torch.load(resolved_path, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("state_dict", checkpoint)
+    state_dict = {
+        key.removeprefix("module."): value
+        for key, value in state_dict.items()
+    }
+    feature_keys = state_dict.get(
+        "encoder.embedding.numeric_embedding.feature_keys"
+    )
+    if feature_keys is not None:
+        model.encoder.embedding.numeric_embedding.set_feature_keys(
+            feature_keys.tolist()
+        )
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    rank0_print(
+        f"Initialized model from {resolved_path}; "
+        f"missing={len(incompatible.missing_keys)}, "
+        f"unexpected={len(incompatible.unexpected_keys)}"
+    )
+    return model
+
+
+class TableTensorizer:
+    def __init__(self, text_to_idx: dict[str, int], type_vocab: dict[str, int]):
+        self.text_to_idx = text_to_idx
+        self.type_vocab = type_vocab
+        self.pad_idx = int(text_to_idx.get("[PAD]", 0))
+
+    def __call__(self, table: pd.DataFrame):
+        tensors = build_table_token_tensors(
+            [table.reset_index(drop=True)],
+            text_to_idx=self.text_to_idx,
+            pad_idx=self.pad_idx,
+            type_vocab=self.type_vocab,
+        )
+        length = int(tensors["seq_mask"][0].sum().item())
+        if length == 0:
+            raise ValueError("Encountered an empty EHR table during pretraining.")
+        return {
+            field: tensors[field][0, :length].clone()
+            for field in SEQUENCE_FIELDS
         }
-    )
-    output_dir: str = field(
-        default="/data/zikun_workspace/checkpoints/pretraining/joint_pretrain"
-    )
-    num_train_epochs: float = field(default=5)
-    per_device_train_batch_size: int = field(default=4)
-    per_device_eval_batch_size: int = field(default=4)
-    gradient_accumulation_steps: int = field(default=1)
-    learning_rate: float = field(default=1e-5)
-    lr_scheduler_type: str = field(default="cosine")
-    warmup_steps: int = field(default=100)
-    weight_decay: float = field(default=0.01)
-    logging_steps: int = field(default=10)
-    save_steps: int = field(default=200)
-    eval_steps: int = field(default=200)
-    save_total_limit: int = field(default=1)
-    bf16: bool = field(default=True)
-    dataloader_num_workers: int = field(default=4)
-    remove_unused_columns: bool = field(default=False)
-    report_to: str = field(default="wandb")
-    wandb_project: Optional[str] = field(default="Joint_Pretraining")
-    metric_for_best_model: str = field(default="eval_loss")
-    greater_is_better: bool = field(default=False)
-    early_stopping_patience: int = field(default=10)
-    ntp_loss_weight: float = field(default=1.0)
-    task_loss_weight: float = field(default=1.0)
-    metric_loss_weight: float = field(default=1.0)
-    ntp_time_loss_weight: float = field(default=0.1)
-    huber_delta: float = field(default=1.0)
-    projection_loss_weight: float = field(default=1.0)
-    transe_loss_weight: float = field(default=0.0)
-    relation_l2_weight: float = field(default=0.0)
-    min_pair_delta: float = field(default=0.0)
-    min_lr_ratio: float = field(default=0.1)
-    activation_checkpointing: bool = field(default=False)
-    grad_cache: bool = field(default=False)
-    grad_cache_micro_batch_size: int = field(default=8)
-    grad_cache_embedding_micro_batch_size: int = field(default=32)
-    length_grouped_batching: bool = field(default=False)
-    length_bucket_count: int = field(default=128)
-    text_embedding_on_gpu: bool = field(default=False)
-
-    def __post_init__(self):
-        super().__post_init__()
-        weights = (
-            self.ntp_loss_weight,
-            self.task_loss_weight,
-            self.metric_loss_weight,
-        )
-        if any(weight < 0 for weight in weights) or sum(weights) <= 0:
-            raise ValueError("Joint pretraining loss weights must be non-negative.")
-        if self.ntp_time_loss_weight < 0:
-            raise ValueError("NTP time loss weight must be non-negative.")
-        if self.huber_delta <= 0:
-            raise ValueError("Huber delta must be positive.")
-        metric_weights = (
-            self.projection_loss_weight,
-            self.transe_loss_weight,
-            self.relation_l2_weight,
-        )
-        if any(weight < 0 for weight in metric_weights):
-            raise ValueError("Metric learning loss weights must be non-negative.")
-        if self.projection_loss_weight <= 0 and self.transe_loss_weight <= 0:
-            raise ValueError(
-                "At least one metric learning loss weight must be positive."
-            )
-        if self.min_pair_delta < 0:
-            raise ValueError("Minimum pair delta must be non-negative.")
-        if self.grad_cache_micro_batch_size <= 0:
-            raise ValueError("GradCache micro batch size must be positive.")
-        if self.grad_cache_embedding_micro_batch_size <= 0:
-            raise ValueError(
-                "GradCache embedding micro batch size must be positive."
-            )
-        if self.length_bucket_count <= 0:
-            raise ValueError("Length bucket count must be positive.")
-        if self.grad_cache and self.gradient_accumulation_steps != 1:
-            raise ValueError(
-                "GradCache currently requires gradient_accumulation_steps=1."
-            )
-        if self.wandb_project:
-            os.environ["WANDB_PROJECT"] = self.wandb_project
-        eval_strategy = str(self.eval_strategy).lower()
-        eval_enabled = not eval_strategy.endswith("no")
-        self.load_best_model_at_end = eval_enabled
 
 
-UNIFIED_PREPROCESSED_FORMAT_VERSION = 5
-SUPPORTED_UNIFIED_PREPROCESSED_FORMATS = {3, 4, 5}
-TASK_TYPE_BINARY = 0
-TASK_TYPE_TTE = 1
-TASK_TYPE_MULTICLASS = 2
-FORMAT_QUERY_KEYS = {
-    TASK_TYPE_BINARY: "__format_binary_classification__",
-    TASK_TYPE_TTE: "__format_time_to_event__",
-    TASK_TYPE_MULTICLASS: "__format_multi_class_classification__",
-}
-FORMAT_QUERY_TEXTS = {
-    FORMAT_QUERY_KEYS[TASK_TYPE_BINARY]: "This is a classification task.",
-    FORMAT_QUERY_KEYS[TASK_TYPE_TTE]: "This is a time-to-event task.",
-    FORMAT_QUERY_KEYS[TASK_TYPE_MULTICLASS]: "This is a classification task.",
-}
+class RawRecordDataset(Dataset):
+    """A lazy concatenation of raw dataset records used by NTP and PML."""
 
-
-class BucketBatchSampler(Sampler[List[int]]):
-    """Length buckets that emit complete global batches.
-
-    The returned batches are global batches. Accelerate splits each batch across
-    ranks, so every rank processes a similarly-sized slice of the same bucket.
-    This avoids the rank-to-rank sequence-length skew caused by sharding local
-    length-grouped batches after they have already been formed.
-    """
-
-    def __init__(
-        self,
-        lengths,
-        local_batch_size: int,
-        world_size: int,
-        bucket_count: int,
-        seed: int,
-        drop_last: bool = False,
-    ):
-        if local_batch_size <= 0:
-            raise ValueError("local_batch_size must be positive")
-        if world_size <= 0:
-            raise ValueError("world_size must be positive")
-        if bucket_count <= 0:
-            raise ValueError("bucket_count must be positive")
-
-        lengths = np.asarray(lengths)
-        if lengths.ndim != 1 or lengths.size == 0:
-            raise ValueError("lengths must be a non-empty 1D array")
-
-        self.local_batch_size = int(local_batch_size)
-        self.world_size = int(world_size)
-        self.batch_size = self.local_batch_size * self.world_size
-        self.bucket_count = int(bucket_count)
-        self.seed = int(seed)
-        self.drop_last = bool(drop_last)
-        self.epoch = 0
-
-        # Quantile buckets keep each global batch in a narrow length range.
-        # The index array is small compared with the preprocessed sequence cache.
-        sorted_indices = np.argsort(lengths, kind="stable")
-        effective_bucket_count = min(
-            self.bucket_count,
-            max(1, len(sorted_indices) // self.batch_size),
-        )
-        self.buckets = [
-            bucket.astype(np.int64, copy=False)
-            for bucket in np.array_split(sorted_indices, effective_bucket_count)
-            if len(bucket) > 0
-        ]
-        self._length = sum(
-            (len(bucket) + self.batch_size - 1) // self.batch_size
-            if not self.drop_last
-            else len(bucket) // self.batch_size
-            for bucket in self.buckets
-        )
+    def __init__(self, parts):
+        self.parts = parts
+        self.part_ends = []
+        total = 0
+        for _, dataset in parts:
+            total += len(dataset)
+            self.part_ends.append(total)
 
     def __len__(self):
-        return self._length
+        return self.part_ends[-1] if self.part_ends else 0
 
-    def set_epoch(self, epoch: int):
-        self.epoch = int(epoch)
+    def _locate(self, index):
+        part_idx = bisect.bisect_right(self.part_ends, index)
+        part_start = 0 if part_idx == 0 else self.part_ends[part_idx - 1]
+        dataset_name, dataset = self.parts[part_idx]
+        return dataset_name, dataset, index - part_start
 
-    def __iter__(self):
-        generator = torch.Generator()
-        generator.manual_seed(self.seed + self.epoch)
-        bucket_order = torch.randperm(
-            len(self.buckets), generator=generator
-        ).tolist()
+    def __getitem__(self, index):
+        _, dataset, local_index = self._locate(index)
+        return dataset[local_index]["measurement_table"]
 
-        for bucket_idx in bucket_order:
-            bucket = self.buckets[bucket_idx]
-            batches = []
-            full_length = (len(bucket) // self.batch_size) * self.batch_size
-            for start in range(0, full_length, self.batch_size):
-                batch = bucket[start : start + self.batch_size]
-                permutation = torch.randperm(
-                    self.batch_size, generator=generator
-                ).numpy()
-                batches.append(batch[permutation].tolist())
-
-            if not self.drop_last and full_length < len(bucket):
-                tail = bucket[full_length:]
-                padding = np.resize(
-                    bucket,
-                    self.batch_size - len(tail),
-                )
-                batch = np.concatenate((tail, padding))
-                permutation = torch.randperm(
-                    self.batch_size, generator=generator
-                ).numpy()
-                batches.append(batch[permutation].tolist())
-
-            batch_order = torch.randperm(
-                len(batches), generator=generator
-            ).tolist()
-            for batch_idx in batch_order:
-                yield batches[batch_idx]
-
-
-class PreprocessedPretrainingTaskDataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        cache_root: str,
-        split: str,
-        task_query_embeddings: Dict[str, torch.Tensor],
-        phenotype_specs: List[pml.PhenotypeQuerySpec],
-        text_to_idx: Dict[str, int],
-        max_table_len: Optional[int] = None,
-        build_lengths: bool = False,
-    ):
-        self.split_dir = os.path.join(cache_root, split)
-        manifest_path = os.path.join(self.split_dir, "manifest.json")
-        if not os.path.exists(manifest_path):
-            raise FileNotFoundError(
-                f"EHR encoder pretraining {split} manifest not found: {manifest_path}. "
-                "Run scripts/preprocess/build_unified_pretrain_cache.sh first."
-            )
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            self.manifest = json.load(f)
-
-        self.format_version = int(self.manifest.get("format_version", -1))
-        if self.format_version not in SUPPORTED_UNIFIED_PREPROCESSED_FORMATS:
-            raise ValueError(f"Unsupported EHR encoder pretraining cache format: {manifest_path}")
-        expected_spec_fingerprint = pml.phenotype_spec_fingerprint(phenotype_specs)
-        if self.manifest.get("phenotype_spec_fingerprint") != expected_spec_fingerprint:
-            raise ValueError(
-                f"Phenotype query specs do not match cached {split} inputs. "
-                "Re-run scripts/preprocess/build_unified_pretrain_cache.sh."
-            )
-        expected_vocab_fingerprint = pml.text_vocab_fingerprint(text_to_idx)
-        if self.manifest.get("text_vocab_fingerprint") != expected_vocab_fingerprint:
-            raise ValueError(
-                f"Table text vocabulary does not match cached {split} inputs. "
-                "Re-run scripts/preprocess/build_unified_pretrain_cache.sh."
-            )
-
-        self.task_names = list(self.manifest.get("task_names", []))
-        self.content_task_names = list(self.manifest.get("content_task_names", self.task_names))
-        self.task_num_classes = list(
-            self.manifest.get("task_num_classes", [1] * len(self.task_names))
-        )
-        missing_tasks = [
-            task_name
-            for task_name in self.task_names
-            if task_name not in task_query_embeddings
-        ]
-        if missing_tasks:
-            raise ValueError(f"Missing task query embeddings: {missing_tasks[:10]}")
-
-        self.num_phenotypes = len(phenotype_specs)
-        if int(self.manifest.get("num_phenotypes", -1)) != self.num_phenotypes:
-            raise ValueError(f"Phenotype count mismatch in {manifest_path}.")
-        self.max_tte_bins = int(
-            self.manifest.get("max_tte_bins", self.manifest.get("365", 0))
-        )
-        self.max_table_len = max_table_len
-
-        self._open_parts = {}
-        if self.format_version >= 4:
-            self.input_parts = list(self.manifest.get("input_parts", []))
-            self.supervision = dict(self.manifest.get("supervision", {}))
-            self.sample_count = int(self.supervision.get("sample_count", 0))
-            supervision_dir = os.path.join(self.split_dir, self.supervision["path"])
-            self.supervision_dir = supervision_dir
-            self.supervision_arrays = {
-                "input_part_ids": np.memmap(
-                    os.path.join(supervision_dir, "input_part_ids.bin"),
-                    dtype=np.int32,
-                    mode="r",
-                    shape=(self.sample_count,),
-                ),
-                "input_local_ids": np.memmap(
-                    os.path.join(supervision_dir, "input_local_ids.bin"),
-                    dtype=np.int32,
-                    mode="r",
-                    shape=(self.sample_count,),
-                ),
-                "task_ids": np.memmap(
-                    os.path.join(supervision_dir, "task_ids.bin"),
-                    dtype=np.int32,
-                    mode="r",
-                    shape=(self.sample_count,),
-                ),
-                "content_task_ids": np.memmap(
-                    os.path.join(supervision_dir, "content_task_ids.bin"),
-                    dtype=np.int32,
-                    mode="r",
-                    shape=(self.sample_count,),
-                ),
-                "task_type_ids": np.memmap(
-                    os.path.join(supervision_dir, "task_type_ids.bin"),
-                    dtype=np.uint8,
-                    mode="r",
-                    shape=(self.sample_count,),
-                ),
-                "labels": np.memmap(
-                    os.path.join(supervision_dir, "labels.bin"),
-                    dtype=np.float32,
-                    mode="r",
-                    shape=(self.sample_count,),
-                ),
-                "survival_labels": np.memmap(
-                    os.path.join(supervision_dir, "survival_labels.bin"),
-                    dtype=np.float32,
-                    mode="r",
-                    shape=(self.sample_count, 3, self.max_tte_bins),
-                ),
+    def metadata(self, index):
+        dataset_name, dataset, local_index = self._locate(index)
+        info = dataset.sample_info[local_index]
+        if dataset_name == "mimic_iv":
+            return {
+                "scope": "mimic_hospital",
+                "patient": info.get("subject_id", ""),
+                "diagnosis": info.get("primary_diagnosis_icd", ""),
             }
-            task_loss_masks_path = os.path.join(supervision_dir, "task_loss_masks.bin")
-            if os.path.exists(task_loss_masks_path):
-                self.supervision_arrays["task_loss_masks"] = np.memmap(
-                    task_loss_masks_path,
-                    dtype=np.float32,
-                    mode="r",
-                    shape=(self.sample_count,),
-                )
-        else:
-            self.parts = list(self.manifest.get("parts", []))
-            self.part_ends = []
-            total = 0
-            for part in self.parts:
-                total += int(part["sample_count"])
-                self.part_ends.append(total)
-            self.sample_count = total
-        if self.sample_count == 0:
-            raise ValueError(f"EHR encoder pretraining {split} cache contains no samples.")
-        if self.format_version >= 4:
-            pml.rank0_print(
-                f"Loaded EHR encoder pretraining {split} cache: "
-                f"{self.sample_count} samples over "
-                f"{len(self.input_parts)} shared input parts"
-            )
-        else:
-            pml.rank0_print(
-                f"Loaded EHR encoder pretraining {split} cache: "
-                f"{self.sample_count} samples across {len(self.parts)} parts"
-            )
-        self.lengths = self._load_or_build_lengths() if build_lengths else None
+        return {
+            "scope": "eicu_icu",
+            "patient": info.get("patient_id", info.get("uniquepid", "")),
+            "diagnosis": info.get("primary_diagnosis", ""),
+        }
 
-    def _load_or_build_lengths(self):
-        if self.format_version < 4:
-            raise ValueError("Length-grouped batching requires cache format >= 4.")
-        lengths_path = os.path.join(self.supervision_dir, "sequence_lengths.bin")
-        expected_bytes = self.sample_count * np.dtype(np.int32).itemsize
 
-        def build_if_needed():
-            if not os.path.exists(lengths_path) or os.path.getsize(lengths_path) != expected_bytes:
-                pml.rank0_print(
-                    f"Building sequence-length index for {self.sample_count} samples...",
-                    flush=True,
-                )
-                local_tmp_path = os.path.join(
-                    "/tmp", f"structehr_sequence_lengths.{os.getpid()}.bin"
-                )
-                remote_tmp_path = f"{lengths_path}.tmp.{os.getpid()}"
-                lengths = np.memmap(
-                    local_tmp_path,
-                    dtype=np.int32,
-                    mode="w+",
-                    shape=(self.sample_count,),
-                )
-                offsets_by_part = {
-                    part_idx: np.load(
-                        os.path.join(self.split_dir, part["path"], "offsets.npy")
-                    )
-                    for part_idx, part in enumerate(self.input_parts)
-                }
-                part_ids = self.supervision_arrays["input_part_ids"]
-                local_ids = self.supervision_arrays["input_local_ids"]
-                chunk_size = 1_000_000
-                for chunk_start in range(0, self.sample_count, chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, self.sample_count)
-                    chunk_part_ids = np.asarray(
-                        part_ids[chunk_start:chunk_end]
-                    )
-                    chunk_local_ids = np.asarray(
-                        local_ids[chunk_start:chunk_end]
-                    )
-                    order = np.argsort(chunk_part_ids, kind="stable")
-                    sorted_part_ids = chunk_part_ids[order]
-                    chunk_lengths = np.empty(
-                        chunk_end - chunk_start, dtype=np.int32
-                    )
-                    unique_parts, starts = np.unique(
-                        sorted_part_ids, return_index=True
-                    )
-                    ends = np.append(starts[1:], len(order))
-                    for part_idx, start, end in zip(unique_parts, starts, ends):
-                        positions = order[start:end]
-                        sample_ids = chunk_local_ids[positions]
-                        offsets = offsets_by_part[int(part_idx)]
-                        chunk_lengths[positions] = (
-                            offsets[sample_ids + 1] - offsets[sample_ids]
-                        ).astype(np.int32)
-                    lengths[chunk_start:chunk_end] = chunk_lengths
-                lengths.flush()
-                del lengths
-                shutil.copyfile(local_tmp_path, remote_tmp_path)
-                os.replace(remote_tmp_path, lengths_path)
-                os.remove(local_tmp_path)
-                pml.rank0_print("Sequence-length index ready.", flush=True)
-
-        if pml.is_distributed():
-            if pml.is_rank0():
-                build_if_needed()
-            dist.barrier()
-        else:
-            build_if_needed()
-
-        lengths = np.memmap(
-            lengths_path,
-            dtype=np.int32,
-            mode="r",
-            shape=(self.sample_count,),
-        )
-        if self.max_table_len is not None:
-            return np.minimum(lengths, int(self.max_table_len))
-        return lengths
+class LimitedRecordDataset(Dataset):
+    def __init__(self, dataset, limit):
+        self.dataset = dataset
+        self.limit = min(int(limit), len(dataset))
 
     def __len__(self):
-        return self.sample_count
+        return self.limit
 
-    def _open_part(self, part_idx: int):
-        if part_idx in self._open_parts:
-            return self._open_parts[part_idx]
+    def __getitem__(self, index):
+        return self.dataset[index]
 
-        part = self.input_parts[part_idx] if self.format_version >= 4 else self.parts[part_idx]
-        part_dir = os.path.join(self.split_dir, part["path"])
-        sample_count = int(part.get("input_count", part.get("sample_count")))
-        total_rows = int(part["total_rows"])
-        arrays = {
-            field_name: np.memmap(
-                os.path.join(part_dir, f"{field_name}.bin"),
-                dtype=np.dtype(dtype),
-                mode="r",
-                shape=(total_rows,),
-            )
-            for field_name, dtype in pml.PREPROCESSED_SEQUENCE_DTYPES.items()
+    def metadata(self, index):
+        return self.dataset.metadata(index)
+
+
+class DatasetView(Dataset):
+    """A fixed index range over a shared raw dataset instance."""
+
+    def __init__(self, dataset, start: int, end: int):
+        self.dataset = dataset
+        self.start = int(start)
+        self.end = int(end)
+        self.sample_info = _SampleInfoView(dataset.sample_info, start, end)
+
+    def __len__(self):
+        return self.end - self.start
+
+    def __getitem__(self, index):
+        return self.dataset[self.start + index]
+
+
+class _SampleInfoView:
+    def __init__(self, records, start: int, end: int):
+        self.records = records
+        self.start = int(start)
+        self.end = int(end)
+
+    def __len__(self):
+        return self.end - self.start
+
+    def __getitem__(self, index):
+        return self.records[self.start + index]
+
+
+class LazyCSVRecords:
+    """Random-access CSV rows without materializing every row as a dict."""
+
+    def __init__(self, paths=None):
+        self.files = []
+        self.file_ends = []
+        self._handles = {}
+        self._pid = os.getpid()
+        if paths:
+            self.add(paths)
+
+    def add(self, paths):
+        total = self.file_ends[-1] if self.file_ends else 0
+        for path in paths:
+            with open(path, "rb") as file:
+                header_line = file.readline()
+                offsets = []
+                while True:
+                    offset = file.tell()
+                    line = file.readline()
+                    if not line:
+                        break
+                    offsets.append(offset)
+            header = next(csv.reader([header_line.decode("utf-8").rstrip("\r\n")]))
+            self.files.append((path, header, np.asarray(offsets, dtype=np.int64)))
+            total += len(offsets)
+            self.file_ends.append(total)
+
+    def __len__(self):
+        return self.file_ends[-1] if self.file_ends else 0
+
+    @staticmethod
+    def _coerce(value: str):
+        if value == "":
+            return ""
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                return float(value)
+            except ValueError:
+                return value
+
+    def __getitem__(self, index):
+        if self._pid != os.getpid():
+            self._handles = {}
+            self._pid = os.getpid()
+        file_idx = bisect.bisect_right(self.file_ends, index)
+        file_start = 0 if file_idx == 0 else self.file_ends[file_idx - 1]
+        path, header, offsets = self.files[file_idx]
+        handle = self._handles.get(file_idx)
+        if handle is None or handle.closed:
+            handle = open(path, "rb")
+            self._handles[file_idx] = handle
+        handle.seek(int(offsets[index - file_start]))
+        line = handle.readline().decode("utf-8").rstrip("\r\n")
+        values = next(csv.reader([line]))
+        return {
+            key: self._coerce(value)
+            for key, value in zip(header, values)
         }
-        opened = {
-            "offsets": np.load(os.path.join(part_dir, "offsets.npy"), mmap_mode="r"),
-            "arrays": arrays,
-            "phenotype_values": np.memmap(
-                os.path.join(part_dir, "phenotype_values.bin"),
-                dtype=np.float32,
-                mode="r",
-                shape=(sample_count, self.num_phenotypes),
-            ),
-            "phenotype_mask": np.memmap(
-                os.path.join(part_dir, "phenotype_mask.bin"),
-                dtype=np.uint8,
-                mode="r",
-                shape=(sample_count, self.num_phenotypes),
-            ),
-        }
-        if self.format_version < 4:
-            opened.update(
-                {
-                    "task_ids": np.memmap(
-                        os.path.join(part_dir, "task_ids.bin"),
-                        dtype=np.int32,
-                        mode="r",
-                        shape=(sample_count,),
-                    ),
-                    "content_task_ids": np.memmap(
-                        os.path.join(part_dir, "content_task_ids.bin"),
-                        dtype=np.int32,
-                        mode="r",
-                        shape=(sample_count,),
-                    ),
-                    "task_type_ids": np.memmap(
-                        os.path.join(part_dir, "task_type_ids.bin"),
-                        dtype=np.uint8,
-                        mode="r",
-                        shape=(sample_count,),
-                    ),
-                    "labels": np.memmap(
-                        os.path.join(part_dir, "labels.bin"),
-                        dtype=np.float32,
-                        mode="r",
-                        shape=(sample_count,),
-                    ),
-                    "survival_labels": np.memmap(
-                        os.path.join(part_dir, "survival_labels.bin"),
-                        dtype=np.float32,
-                        mode="r",
-                        shape=(sample_count, 3, self.max_tte_bins),
-                    ),
-                }
-            )
-        self._open_parts[part_idx] = opened
-        return opened
-
-    def __getitem__(self, idx: int):
-        if idx < 0:
-            idx += self.sample_count
-        if idx < 0 or idx >= self.sample_count:
-            raise IndexError(idx)
-
-        if self.format_version >= 4:
-            part_idx = int(self.supervision_arrays["input_part_ids"][idx])
-            local_idx = int(self.supervision_arrays["input_local_ids"][idx])
-        else:
-            part_idx = bisect.bisect_right(self.part_ends, idx)
-            part_start = 0 if part_idx == 0 else self.part_ends[part_idx - 1]
-            local_idx = idx - part_start
-        opened = self._open_part(part_idx)
-        row_start = int(opened["offsets"][local_idx])
-        row_end = int(opened["offsets"][local_idx + 1])
-        if self.max_table_len is not None:
-            # Apply the same right-truncation before copying from the memmap.
-            # Some cached encounters contain >200k rows; loading the complete
-            # sequence and truncating later in the collator can stall one rank
-            # long enough for the other ranks to hit an NCCL timeout.
-            row_start = max(row_start, row_end - int(self.max_table_len))
-
-        sample = {
-            field_name: torch.from_numpy(
-                np.asarray(array[row_start:row_end]).copy()
-            )
-            for field_name, array in opened["arrays"].items()
-        }
-        supervision = self.supervision_arrays if self.format_version >= 4 else opened
-        supervision_idx = idx if self.format_version >= 4 else local_idx
-        sample["task_id"] = int(supervision["task_ids"][supervision_idx])
-        sample["content_task_id"] = int(supervision["content_task_ids"][supervision_idx])
-        sample["task_type_id"] = int(supervision["task_type_ids"][supervision_idx])
-        sample["label"] = float(supervision["labels"][supervision_idx])
-        if "task_loss_masks" in supervision:
-            sample["task_loss_mask"] = float(supervision["task_loss_masks"][supervision_idx])
-        else:
-            sample["task_loss_mask"] = 1.0
-        sample["survival_labels"] = torch.from_numpy(
-            np.asarray(supervision["survival_labels"][supervision_idx]).copy()
-        )
-        sample["phenotype_values"] = torch.from_numpy(
-            np.asarray(opened["phenotype_values"][local_idx]).copy()
-        )
-        sample["phenotype_mask"] = torch.from_numpy(
-            np.asarray(opened["phenotype_mask"][local_idx]).copy()
-        ).bool()
-        return sample
 
 
-class PreprocessedUnifiedTaskCollator:
-    def __init__(
-        self,
-        task_query_embeddings: Dict[str, torch.Tensor],
-        task_names: List[str],
-        format_query_embeddings: Dict[str, torch.Tensor],
-        task_class_query_embeddings: torch.Tensor,
-        task_class_query_mask: torch.Tensor,
-        max_table_len: Optional[int],
-        min_table_rows: int,
-    ):
-        self.instruction_query_embeddings = torch.stack(
-            [task_query_embeddings[task_name].float() for task_name in task_names],
-            dim=0,
-        )
-        self.format_query_embeddings = torch.stack(
+def parse_binary_label(value) -> int:
+    text = str(value).strip().strip('"').strip("'").lower()
+    if text in {"true", "yes"}:
+        return 1
+    if text in {"false", "no"}:
+        return 0
+    return int(float(text))
+
+
+def build_survival_target(
+    time_to_event: float,
+    event_observed: bool,
+    horizon_days: float,
+    max_bins: int = 365,
+):
+    num_bins = max(1, min(int(np.ceil(horizon_days)), max_bins))
+    observed_time = min(max(float(time_to_event), 0.0), float(num_bins))
+    exposure = np.zeros(max_bins, dtype=np.float32)
+    event_bins = np.zeros(max_bins, dtype=np.float32)
+    stage_mask = np.zeros(max_bins, dtype=np.float32)
+    stage_mask[:num_bins] = 1.0
+    full_bins = min(int(np.floor(observed_time)), num_bins)
+    exposure[:full_bins] = 1.0
+    if full_bins < num_bins:
+        exposure[full_bins] = observed_time - full_bins
+    if event_observed and 0.0 < observed_time <= num_bins:
+        event_bins[min(int(np.ceil(observed_time) - 1), num_bins - 1)] = 1.0
+    return np.stack([exposure, event_bins, stage_mask])
+
+
+class RawSFTDataset(Dataset):
+    """Lazy classification and TTE supervision over raw EHR datasets."""
+
+    def __init__(self, parts, task_names):
+        self.parts = parts
+        self.task_names = sorted(task_names)
+        self.part_ends = []
+        total = 0
+        for _, dataset, _ in parts:
+            total += len(dataset)
+            self.part_ends.append(total)
+        self.task_info = all_task_info()
+        self.max_multilabel_classes = max(
             [
-                format_query_embeddings[FORMAT_QUERY_KEYS[TASK_TYPE_BINARY]].float(),
-                format_query_embeddings[FORMAT_QUERY_KEYS[TASK_TYPE_TTE]].float(),
-                format_query_embeddings[FORMAT_QUERY_KEYS[TASK_TYPE_MULTICLASS]].float(),
+                int(task_info_for(name)["num_classes"])
+                for name in self.task_names
+                if task_info_for(name).get("task_type")
+                == "multi_label_classification"
+                and task_info_for(name).get("sft_target") != "sampled_candidates"
             ],
-            dim=0,
+            default=0,
         )
-        self.task_class_query_embeddings = task_class_query_embeddings.float()
-        self.task_class_query_mask = task_class_query_mask.float()
-        self.max_table_len = max_table_len
-        self.min_table_rows = min_table_rows
 
-    def __call__(self, batch):
-        kept_samples = []
-        for sample in batch:
-            sequence_length = int(sample["item_ids"].numel())
-            if self.max_table_len is not None:
-                sequence_length = min(sequence_length, int(self.max_table_len))
-            if sequence_length >= self.min_table_rows:
-                kept_samples.append((sample, sequence_length))
-        if not kept_samples:
-            raise ValueError("All cached samples in this batch are too short after truncation.")
+    def __len__(self):
+        return self.part_ends[-1] if self.part_ends else 0
 
-        batch_size = len(kept_samples)
-        padded_length = max(sequence_length for _, sequence_length in kept_samples)
-        table_tensors = {
-            "item_ids": torch.zeros(batch_size, padded_length, dtype=torch.long),
-            "unit_ids": torch.zeros(batch_size, padded_length, dtype=torch.long),
-            "value_text_ids": torch.zeros(batch_size, padded_length, dtype=torch.long),
-            "times": torch.zeros(batch_size, padded_length, dtype=torch.float),
-            "numeric_values": torch.zeros(batch_size, padded_length, dtype=torch.float),
-            "numeric_mask": torch.zeros(batch_size, padded_length, dtype=torch.float),
-            "seq_mask": torch.zeros(batch_size, padded_length, dtype=torch.float),
-            "type_ids": torch.zeros(batch_size, padded_length, dtype=torch.long),
+    def __getitem__(self, index):
+        part_idx = bisect.bisect_right(self.part_ends, index)
+        part_start = 0 if part_idx == 0 else self.part_ends[part_idx - 1]
+        dataset_name, dataset, objective = self.parts[part_idx]
+        sample_idx = index - part_start
+        sample = dataset[sample_idx]
+        sample_info = dataset.sample_info[sample_idx]
+        raw_task_name = str(
+            sample_info["task"] if dataset_name == "mimic_iv" else sample_info["task_name"]
+        )
+        task_name = task_key(dataset_name, raw_task_name)
+        multilabel_labels = np.zeros(self.max_multilabel_classes, dtype=np.float32)
+        candidate_texts = []
+        candidate_labels = []
+
+        if objective == "tte":
+            survival_labels = build_survival_target(
+                time_to_event=float(sample_info["time_to_event"]),
+                event_observed=bool(int(float(sample_info["event_observed"]))),
+                horizon_days=float(sample_info["horizon_days"]),
+            )
+            task_type_id = TASK_TYPE_TTE
+            label = 0.0
+        else:
+            info = task_info_for(task_name)
+            raw_label = (
+                sample_info["target"]
+                if dataset_name == "mimic_iv"
+                else sample_info.get("label", sample["output"])
+            )
+            if isinstance(raw_label, str) and raw_label.strip().startswith("["):
+                raw_label = ast.literal_eval(raw_label)
+            if info.get("sft_target") == "sampled_candidates":
+                positive_labels = set(raw_label if isinstance(raw_label, list) else [raw_label])
+                candidate_texts = sample.get("candidates") or list(positive_labels)
+                candidate_labels = [text in positive_labels for text in candidate_texts]
+                task_type_id = TASK_TYPE_CANDIDATE_DIAGNOSIS
+                label = 0.0
+            elif info["task_type"] == "multi_label_classification":
+                for class_index in raw_label:
+                    multilabel_labels[int(class_index)] = 1.0
+                task_type_id = TASK_TYPE_MULTILABEL
+                label = 0.0
+            elif info["task_type"] == "multi_class_classification":
+                task_type_id = TASK_TYPE_MULTICLASS
+                label = int(float(raw_label))
+            else:
+                task_type_id = TASK_TYPE_BINARY
+                label = parse_binary_label(raw_label)
+            survival_labels = np.zeros((3, 365), dtype=np.float32)
+
+        return {
+            "table": sample["measurement_table"],
+            "task": task_name,
+            "task_type_id": task_type_id,
+            "label": label,
+            "survival_labels": survival_labels,
+            "multilabel_labels": multilabel_labels,
+            "candidate_texts": candidate_texts,
+            "candidate_labels": candidate_labels,
         }
-        task_ids = []
-        content_task_ids = []
-        task_type_ids = []
-        labels = []
-        task_loss_masks = []
-        survival_labels = []
-        phenotype_values = []
-        phenotype_masks = []
 
-        for row_idx, (sample, sequence_length) in enumerate(kept_samples):
-            source_length = int(sample["item_ids"].numel())
-            source_start = source_length - sequence_length
-            source_end = source_start + sequence_length
-            for field_name in ("item_ids", "unit_ids", "value_text_ids", "type_ids"):
-                table_tensors[field_name][row_idx, :sequence_length] = sample[
-                    field_name
-                ][source_start:source_end].long()
-            for field_name in ("numeric_values", "numeric_mask"):
-                table_tensors[field_name][row_idx, :sequence_length] = sample[
-                    field_name
-                ][source_start:source_end].float()
 
-            times = sample["times"][source_start:source_end].float().clone()
-            valid_times = times > 0
-            if valid_times.any():
-                times[valid_times] = times[valid_times] - times[valid_times][0] + 1.0
-            table_tensors["times"][row_idx, :sequence_length] = times
-            table_tensors["seq_mask"][row_idx, :sequence_length] = 1.0
+def _load_records(path: str):
+    if path.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    return pd.read_csv(path, low_memory=False).to_dict(orient="records")
 
-            task_ids.append(int(sample["task_id"]))
-            content_task_ids.append(int(sample["content_task_id"]))
-            task_type_ids.append(int(sample["task_type_id"]))
-            labels.append(float(sample["label"]))
-            task_loss_masks.append(float(sample.get("task_loss_mask", 1.0)))
-            survival_labels.append(sample["survival_labels"].float())
-            phenotype_values.append(sample["phenotype_values"].float())
-            phenotype_masks.append(sample["phenotype_mask"].bool())
 
-        content_task_id_tensor = torch.tensor(content_task_ids, dtype=torch.long)
-        task_id_tensor = torch.tensor(task_ids, dtype=torch.long)
-        task_type_id_tensor = torch.tensor(task_type_ids, dtype=torch.long)
-        instruction_query_embeds = self.instruction_query_embeddings.index_select(
-            0, task_id_tensor
+def _classification_paths(path_arg: str, task_info: dict):
+    paths = []
+    for raw_path in path_arg.split(","):
+        path = raw_path.strip()
+        if not path:
+            continue
+        candidates = sorted(glob(os.path.join(path, "*.csv"))) if os.path.isdir(path) else [path]
+        for candidate in candidates:
+            task_name = os.path.splitext(os.path.basename(candidate))[0]
+            if task_info.get(task_name, {}).get("task_type") in {
+                "binary_classification",
+                "multi_class_classification",
+                "multi_label_classification",
+            }:
+                paths.append(candidate)
+    return paths
+
+
+_MIMIC_DATASETS = {}
+
+
+def _mimic_parts(root_dir: str, paths, objective: str):
+    if not paths:
+        return []
+    dataset = _MIMIC_DATASETS.get(root_dir)
+    if dataset is None:
+        dataset = MIMICIV(
+            root_dir=root_dir,
+            sample_info_path=paths[0],
+            lazy_mode=True,
+            shuffle=False,
+            max_samples=None,
+            use_table_length_cache=False,
+            load_sample_info=False,
         )
-        format_query_embeds = self.format_query_embeddings.index_select(
-            0, task_type_id_tensor
+        dataset.sample_info = LazyCSVRecords(paths)
+        _MIMIC_DATASETS[root_dir] = dataset
+        start = 0
+    else:
+        start = len(dataset.sample_info)
+        dataset.sample_info.add(paths)
+    return [("mimic_iv", DatasetView(dataset, start, len(dataset.sample_info)), objective)]
+
+
+def _eicu_parts(root_dir, processed_dir, records, task_names, objective):
+    task_names = set(task_names)
+    selected = [row for row in records if str(row.get("task_name")) in task_names]
+    if not selected:
+        return []
+    dataset = EICUDataset(
+        root_dir=root_dir,
+        processed_dir=processed_dir,
+        sample_info=selected,
+        task_name=None,
+        lazy_mode=True,
+        shuffle=False,
+    )
+    return [("eicu", dataset, objective)]
+
+
+def _tte_paths(root: str, dataset_name: str, split: str):
+    if dataset_name == "eicu":
+        pattern = os.path.join(root, dataset_name, split, "*.csv")
+    else:
+        pattern = os.path.join(root, dataset_name, "indices", split, "*.csv")
+    return sorted(path for path in glob(pattern) if os.path.getsize(path) > 0)
+
+
+_EICU_PRIMARY_DIAGNOSES = {}
+
+
+def load_eicu_primary_diagnoses(raw_dir: str):
+    if raw_dir in _EICU_PRIMARY_DIAGNOSES:
+        return _EICU_PRIMARY_DIAGNOSES[raw_dir]
+    path = os.path.join(raw_dir, "admissionDx.csv.gz")
+    primary = {}
+    for chunk in pd.read_csv(
+        path,
+        usecols=["patientunitstayid", "admitdxpath", "admitdxname"],
+        chunksize=500_000,
+        low_memory=False,
+    ):
+        paths = chunk["admitdxpath"].fillna("").astype(str)
+        selected = chunk[
+            paths.str.contains("|All Diagnosis|", regex=False)
+            & paths.str.contains("|Diagnosis|", regex=False)
+        ]
+        for stay_id, diagnosis in selected[
+            ["patientunitstayid", "admitdxname"]
+        ].itertuples(index=False, name=None):
+            if pd.notna(stay_id) and str(diagnosis).strip():
+                key = int(stay_id)
+                if key in primary:
+                    raise ValueError(f"Multiple eICU primary diagnoses for stay {key}.")
+                primary[key] = str(diagnosis).strip().lower()
+    _EICU_PRIMARY_DIAGNOSES[raw_dir] = primary
+    return primary
+
+
+def build_context_records(args, split: str):
+    parts = []
+    if "mimic_iv" in args.dataset:
+        path = args.pretraining_sample_info_path if split == "train" else args.pretraining_val_sample_info_path
+        if os.path.exists(path):
+            parts.extend((name, dataset) for name, dataset, _ in _mimic_parts(args.root_dir, [path], "context"))
+    if "eicu" in args.dataset:
+        path = args.eicu_pretraining_sample_info_path if split == "train" else args.eicu_pretraining_val_sample_info_path
+        if os.path.exists(path):
+            records = _load_records(path)
+            primary = (
+                load_eicu_primary_diagnoses(args.eicu_raw_dir)
+                if int(os.environ.get("RANK", "0")) == 0
+                else {}
+            )
+            for record in records:
+                record["primary_diagnosis"] = primary.get(int(record["icustay_id"]), "")
+            dataset = EICUDataset(
+                root_dir=args.eicu_root_dir,
+                processed_dir=args.eicu_processed_dir,
+                sample_info=records,
+                task_name=None,
+                lazy_mode=True,
+                shuffle=False,
+            )
+            parts.append(("eicu", dataset))
+    dataset = RawRecordDataset(parts)
+    if len(dataset) == 0:
+        raise ValueError(f"No raw {split} pretraining-context records were found.")
+    return dataset
+
+
+def build_sft_records(args, split: str):
+    info = all_task_info()
+    parts = []
+    task_names = set()
+    if "mimic_iv" in args.dataset:
+        path_arg = args.task_train_sample_info_path if split == "train" else args.task_val_sample_info_path
+        paths = _classification_paths(path_arg, info)
+        parts.extend(_mimic_parts(args.root_dir, paths, "classification"))
+        task_names.update(
+            task_key("mimic_iv", os.path.splitext(os.path.basename(path))[0])
+            for path in paths
         )
-        class_query_embeds = self.task_class_query_embeddings.index_select(0, task_id_tensor)
-        class_query_mask = self.task_class_query_mask.index_select(0, task_id_tensor)
-        query_embeds = torch.zeros(
-            batch_size,
-            class_query_embeds.size(1) + 2,
-            instruction_query_embeds.size(-1),
-            dtype=instruction_query_embeds.dtype,
+    if "eicu" in args.dataset:
+        path = args.eicu_task_train_sample_info_path if split == "train" else args.eicu_task_val_sample_info_path
+        records = _load_records(path)
+        available_tasks = {str(row.get("task_name", "")) for row in records}
+        tasks = sorted(
+            name
+            for name, task in info.items()
+            if name in available_tasks
+            and task.get("task_type") in {
+                "binary_classification",
+                "multi_class_classification",
+                "multi_label_classification",
+            }
         )
-        query_mask = torch.zeros(batch_size, class_query_embeds.size(1) + 2, dtype=torch.float)
-        output_query_mask = torch.zeros_like(query_mask)
+        parts.extend(_eicu_parts(args.eicu_root_dir, args.eicu_processed_dir, records, tasks, "classification"))
+        task_names.update(task_key("eicu", name) for name in tasks)
+    if args.sft_include_tte:
+        for dataset_name in (name for name in args.dataset if name in {"mimic_iv", "eicu"}):
+            paths = _tte_paths(args.tte_index_dir, dataset_name, split)
+            if not paths:
+                continue
+            if dataset_name == "mimic_iv":
+                parts.extend(_mimic_parts(args.root_dir, paths, "tte"))
+                task_names.update(os.path.splitext(os.path.basename(path))[0] for path in paths)
+            else:
+                records = [row for path in paths for row in _load_records(path)]
+                tasks = sorted({str(row["task_name"]) for row in records})
+                if dataset_name == "eicu":
+                    parts.extend(_eicu_parts(args.eicu_root_dir, args.eicu_processed_dir, records, tasks, "tte"))
+                task_names.update(tasks)
+    dataset = RawSFTDataset(parts, task_names)
+    if len(dataset) == 0:
+        raise ValueError(f"No raw {split} SFT records were found.")
+    return dataset
 
-        query_embeds[:, 0] = instruction_query_embeds
-        query_embeds[:, 1] = format_query_embeds
-        query_mask[:, :2] = 1.0
-        binary_or_tte_rows = (task_type_id_tensor == TASK_TYPE_BINARY) | (
-            task_type_id_tensor == TASK_TYPE_TTE
+
+class TaggedDataset(Dataset):
+    def __init__(self, objective: str, dataset):
+        self.objective = objective
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        return {"objective": self.objective, "sample": self.dataset[index]}
+
+
+class ScheduledObjectiveDataset(Dataset):
+    """Lay out homogeneous device batches for Accelerate's batch sharding."""
+
+    def __init__(self, datasets, optimizer_schedule, batch_size, world_size, seed):
+        self.datasets = datasets
+        self.entries = []
+        counters = {objective: 0 for objective in datasets}
+        rng = np.random.default_rng(seed)
+        orders = {
+            objective: rng.permutation(len(dataset)).tolist()
+            for objective, dataset in datasets.items()
+        }
+        for objective in optimizer_schedule:
+            for _ in range(world_size):
+                for _ in range(batch_size):
+                    order = orders[objective]
+                    position = counters[objective]
+                    self.entries.append((objective, order[position % len(order)]))
+                    counters[objective] += 1
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, index):
+        objective, sample_index = self.entries[index]
+        return {"objective": objective, "sample": self.datasets[objective][sample_index]}
+
+
+def build_objective_schedule(ntp_steps, ntp_ratio, pml_ratio, sft_ratio, seed):
+    counts = {
+        "ntp": int(ntp_steps),
+        "pml": max(1, int(round(ntp_steps * pml_ratio / ntp_ratio))),
+        "sft": max(1, int(round(ntp_steps * sft_ratio / ntp_ratio))),
+    }
+    return interleave_objective_counts(counts, seed), counts
+
+
+def interleave_objective_counts(counts, seed):
+    rng = np.random.default_rng(seed)
+    positioned = []
+    for objective, count in counts.items():
+        jitter = rng.uniform(-0.1, 0.1, size=count) / max(count, 1)
+        positioned.extend(
+            ((index + 0.5) / count + jitter[index], objective)
+            for index in range(count)
         )
-        output_query_mask[binary_or_tte_rows, :2] = 1.0
-
-        multiclass_rows = task_type_id_tensor == TASK_TYPE_MULTICLASS
-        if multiclass_rows.any():
-            query_embeds[multiclass_rows, 2:] = class_query_embeds[multiclass_rows]
-            query_mask[multiclass_rows, 2:] = class_query_mask[multiclass_rows]
-            output_query_mask[multiclass_rows, 2:] = class_query_mask[multiclass_rows]
-        table_tensors["query_embeds"] = query_embeds
-        table_tensors["query_mask"] = query_mask
-        table_tensors["output_query_mask"] = output_query_mask
-        table_tensors["labels"] = torch.tensor(labels, dtype=torch.float)
-        table_tensors["task_loss_mask"] = torch.tensor(task_loss_masks, dtype=torch.float)
-        table_tensors["task_ids"] = task_id_tensor
-        table_tensors["task_type_ids"] = task_type_id_tensor
-        table_tensors["survival_labels"] = torch.stack(survival_labels)
-        table_tensors["phenotype_values"] = torch.stack(phenotype_values)
-        table_tensors["phenotype_mask"] = torch.stack(phenotype_masks)
-        return table_tensors
+    return [objective for _, objective in sorted(positioned)]
 
 
-class WeightedLossCombiner(nn.Module):
-    TASK_NAMES = ("ntp", "task", "metric")
+class ObjectiveTrainer(Trainer):
+    def __init__(self, *args, task_names=None, task_infos=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._objective_losses = defaultdict(list)
+        self._task_names = task_names or []
+        self._task_infos = task_infos or []
+        self._eval_accumulator = None
 
-    def __init__(self, weights: List[float]):
-        super().__init__()
-        self.register_buffer("weights", torch.tensor(weights, dtype=torch.float))
+    def _get_train_sampler(self, train_dataset=None):
+        return SequentialSampler(train_dataset or self.train_dataset)
 
-    def forward(self, losses: Dict[str, torch.Tensor]):
-        loss_vector = torch.stack([losses[name] for name in self.TASK_NAMES])
-        weights = self.weights.to(loss_vector.device, loss_vector.dtype)
-        weighted_losses = weights * loss_vector
-        total = weighted_losses.sum()
-        return total, weighted_losses
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        num_items_in_batch=None,
+    ):
+        objective = inputs.get("objective")
+        result = super().compute_loss(
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            num_items_in_batch=num_items_in_batch,
+        )
+        loss = result[0] if return_outputs else result
+        if model.training and isinstance(objective, str):
+            self._objective_losses[objective].append(float(loss.detach().mean().cpu()))
+        return result
+
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys=None,
+    ):
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad(), self.compute_loss_context_manager():
+            outputs = model(**inputs, collect_metrics=True)
+        loss = outputs["loss"].detach().mean()
+        self._eval_accumulator.update(outputs["metric_payload"])
+        return loss, None, None
+
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix="eval",
+    ):
+        selected_dataset = self.eval_dataset if eval_dataset is None else eval_dataset
+        if isinstance(selected_dataset, dict):
+            return super().evaluate(
+                eval_dataset=eval_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+        self._eval_accumulator = EvaluationAccumulator()
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        custom_metrics = self._eval_accumulator.compute(
+            metric_key_prefix,
+            self._task_names,
+            self._task_infos,
+        )
+        metrics.update(custom_metrics)
+        self.log(custom_metrics)
+        performance_suffixes = (
+            "_runtime",
+            "_samples_per_second",
+            "_steps_per_second",
+            "_jit_compilation_time",
+        )
+        return {
+            key: value
+            for key, value in metrics.items()
+            if not key.endswith(performance_suffixes)
+        }
+
+    def log(self, logs, start_time=None):
+        eval_performance_suffixes = (
+            "_runtime",
+            "_samples_per_second",
+            "_steps_per_second",
+            "_jit_compilation_time",
+        )
+        logs = {
+            key: value
+            for key, value in logs.items()
+            if not (
+                key.startswith("eval_")
+                and key.endswith(eval_performance_suffixes)
+            )
+        }
+        if "loss" in logs:
+            for objective, values in self._objective_losses.items():
+                if values:
+                    logs[f"{objective}_loss"] = float(np.mean(values))
+            self._objective_losses.clear()
+        return super().log(logs, start_time)
+
+
+def collate_tables(samples):
+    lengths = [int(sample["item_ids"].numel()) for sample in samples]
+    max_length = max(lengths)
+    batch = {}
+    for field in SEQUENCE_FIELDS:
+        dtype = torch.long if field in INTEGER_FIELDS else torch.float
+        batch[field] = torch.zeros(len(samples), max_length, dtype=dtype)
+    batch["seq_mask"] = torch.zeros(len(samples), max_length, dtype=torch.float)
+    for row, (sample, length) in enumerate(zip(samples, lengths)):
+        for field in SEQUENCE_FIELDS:
+            values = sample[field]
+            batch[field][row, :length] = (
+                values.long() if field in INTEGER_FIELDS else values.float()
+            )
+        batch["seq_mask"][row, :length] = 1.0
+    return batch
+
+
+class ObjectiveCollator:
+    def __init__(self, task_query_bank: torch.Tensor, task_query_mask: torch.Tensor):
+        self.task_query_bank = task_query_bank
+        self.task_query_mask = task_query_mask
+
+    def __call__(self, samples):
+        objectives = {sample["objective"] for sample in samples}
+        if len(objectives) != 1:
+            raise ValueError(f"A batch must contain one objective, got {sorted(objectives)}")
+        objective = objectives.pop()
+        objective_samples = [sample["sample"] for sample in samples]
+        if objective == "ntp":
+            return {"objective": objective, "batch": collate_tables(objective_samples)}
+        if objective == "pml":
+            pml_batch = collate_tables(
+                [sample["left"] for sample in objective_samples]
+                + [sample["right"] for sample in objective_samples]
+            )
+            pml_batch["query_ids"] = torch.tensor(
+                [sample["query_id"] for sample in objective_samples], dtype=torch.long
+            )
+            pml_batch["target_deltas"] = torch.tensor(
+                [sample["target_delta"] for sample in objective_samples], dtype=torch.float
+            )
+            return {"objective": objective, "batch": pml_batch}
+
+        sft_samples = objective_samples
+        sft_batch = collate_tables(sft_samples)
+        task_ids = torch.tensor([sample["task_id"] for sample in sft_samples])
+        sft_batch["task_ids"] = task_ids
+        sft_batch["query_embeddings"] = self.task_query_bank.index_select(0, task_ids)
+        sft_batch["query_mask"] = self.task_query_mask.index_select(0, task_ids)
+        sft_batch["task_type_ids"] = torch.tensor(
+            [sample["task_type_id"] for sample in sft_samples], dtype=torch.long
+        )
+        sft_batch["labels"] = torch.tensor(
+            [sample["label"] for sample in sft_samples], dtype=torch.float
+        )
+        sft_batch["survival_labels"] = torch.stack(
+            [sample["survival_labels"] for sample in sft_samples]
+        )
+        sft_batch["multilabel_labels"] = torch.stack(
+            [sample["multilabel_labels"] for sample in sft_samples]
+        )
+        max_candidates = max(
+            1, max(sample["candidate_text_ids"].numel() for sample in sft_samples)
+        )
+        sft_batch["candidate_text_ids"] = torch.zeros(
+            len(sft_samples), max_candidates, dtype=torch.long
+        )
+        sft_batch["candidate_mask"] = torch.zeros(
+            len(sft_samples), max_candidates, dtype=torch.bool
+        )
+        sft_batch["candidate_labels"] = torch.zeros(
+            len(sft_samples), max_candidates, dtype=torch.float
+        )
+        for row, sample in enumerate(sft_samples):
+            count = sample["candidate_text_ids"].numel()
+            if count:
+                sft_batch["candidate_text_ids"][row, :count] = sample["candidate_text_ids"]
+                sft_batch["candidate_mask"][row, :count] = True
+                sft_batch["candidate_labels"][row, :count] = sample["candidate_labels"]
+        return {"objective": objective, "batch": sft_batch}
 
 
 class JointPretrainingModel(PreTrainedModel):
@@ -836,1187 +850,589 @@ class JointPretrainingModel(PreTrainedModel):
     def __init__(
         self,
         config,
-        embedding_matrix: torch.Tensor,
-        phenotype_query_embedding_matrix: torch.Tensor,
-        phenotype_scales: torch.Tensor,
-        task_num_classes: List[int],
-        training_args: PretrainingArguments,
+        table_embeddings,
+        phenotype_query_embeddings,
+        diagnosis_embeddings,
+        query_dim,
+        max_tte_bins,
+        ntp_time_weight,
+        pml_huber_delta,
     ):
         super().__init__(config)
-        if embedding_matrix.size(1) != config.text_dim:
-            raise ValueError("Table embedding dimension does not match config.")
-        hidden_size = config.dim_out if config.dim_out is not None else config.dim
-        query_dim = hidden_size
-
         self.encoder = LongTableEncoder1D(config)
         self.adapter = QFormerAdapter(config)
-        if training_args.text_embedding_on_gpu:
-            embedding_dtype = (
-                torch.bfloat16
-                if training_args.bf16
-                else torch.float16
-                if training_args.fp16
-                else torch.float32
-            )
-            self.register_buffer(
-                "text_embedding_matrix",
-                embedding_matrix.to(dtype=embedding_dtype),
-                persistent=False,
-            )
-        else:
-            self.text_embedding_matrix = embedding_matrix.cpu()
-        self.ntp_head = NextTokenPredictionDecoder(
+        self.text_embedding = nn.Embedding.from_pretrained(
+            table_embeddings.float(), freeze=True
+        )
+        self.diagnosis_embedding_matrix = diagnosis_embeddings.float().cpu()
+        self.ntp = NextTokenPredictionDecoder(
             hidden_dim=config.dim,
             text_dim=config.text_dim,
             type_vocab_size=config.type_vocab_size,
-            fourier_scales=config.fourier_scales,
-            time_loss_weight=training_args.ntp_time_loss_weight,
+            numeric_embedding_dim=config.numeric_embedding_dim,
+            time_loss_weight=ntp_time_weight,
         )
-        self.task_query_head = QueryCrossAttentionHead(config, query_dim=query_dim)
-        self.task_classifier = QueryClassificationHead(query_dim=query_dim)
-        self.task_survival_head = nn.Linear(query_dim, 365)
-        self.register_buffer(
-            "task_num_classes",
-            torch.tensor(task_num_classes, dtype=torch.long),
-            persistent=False,
+        hidden_size = config.dim_out or config.dim
+        self.pml = PhenotypeMetricModel(
+            hidden_size,
+            phenotype_query_embeddings,
+            pml_huber_delta,
         )
-        self.metric_pooling = pml.AttentionPooling(hidden_size)
-        self.query_embedding_matrix = nn.Parameter(
-            phenotype_query_embedding_matrix.float(), requires_grad=False
-        )
-        self.phenotype_scales = nn.Parameter(
-            phenotype_scales.float(), requires_grad=False
-        )
-        self.relation_projection = nn.Sequential(
-            nn.Linear(phenotype_query_embedding_matrix.size(-1), hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
-        self.huber_delta = float(training_args.huber_delta)
-        self.projection_loss_weight = float(
-            training_args.projection_loss_weight
-        )
-        self.transe_loss_weight = float(training_args.transe_loss_weight)
-        self.relation_l2_weight = float(training_args.relation_l2_weight)
-        self.min_pair_delta = float(training_args.min_pair_delta)
-        self.loss_combiner = WeightedLossCombiner(
-            weights=[
-                training_args.ntp_loss_weight,
-                training_args.task_loss_weight,
-                training_args.metric_loss_weight,
-            ]
-        )
+        self.sft = SFTObjective(config, query_dim, max_tte_bins)
         self.post_init()
 
-    def text_lookup(self, token_ids, dtype, device):
-        if self.text_embedding_matrix.device.type == "cpu":
-            flat = self.text_embedding_matrix.index_select(
-                0, token_ids.reshape(-1).cpu()
-            )
-            flat = flat.to(device=device, dtype=dtype, non_blocking=True)
-        else:
-            flat = self.text_embedding_matrix.index_select(
-                0, token_ids.reshape(-1).to(self.text_embedding_matrix.device)
-            ).to(dtype=dtype)
-        return flat.view(*token_ids.shape, flat.size(-1))
+    def _init_weights(self, module):
+        if module is self.text_embedding:
+            return
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.weight.data.fill_(1.0)
+            module.bias.data.zero_()
 
-    def encode_rows(self, inputs):
-        dtype = self.encoder.embedding.item_proj.weight.dtype
-        device = self.encoder.embedding.item_proj.weight.device
-        item_emb = self.text_lookup(inputs["item_ids"], dtype, device)
-        unit_emb = self.text_lookup(inputs["unit_ids"], dtype, device)
-        value_emb = self.text_lookup(inputs["value_text_ids"], dtype, device)
-        hidden_states, hidden_mask = self.encoder(
-            item_emb=item_emb,
-            unit_emb=unit_emb,
-            value_emb=value_emb,
-            times=inputs["times"],
-            numeric_values=inputs["numeric_values"],
-            numeric_mask=inputs["numeric_mask"],
-            seq_mask=inputs.get("seq_mask"),
-            type_ids=inputs.get("type_ids"),
+    def encode(self, batch):
+        item = self.text_embedding(batch["item_ids"])
+        unit = self.text_embedding(batch["unit_ids"])
+        value = self.text_embedding(batch["value_text_ids"])
+        feature_ids = self.encoder.numeric_feature_ids(batch["item_ids"], batch["unit_ids"])
+        hidden, mask = self.encoder(
+            item_emb=item,
+            unit_emb=unit,
+            value_emb=value,
+            times=batch["times"],
+            numeric_values=batch["numeric_values"],
+            numeric_mask=batch["numeric_mask"],
+            numeric_feature_ids=feature_ids,
+            seq_mask=batch["seq_mask"],
+            type_ids=batch["type_ids"],
             return_mask=True,
         )
-        return hidden_states, hidden_mask, item_emb, unit_emb, value_emb
+        return hidden, mask, item, unit, value, feature_ids
 
-    def forward_ntp(self, inputs):
-        hidden_states, hidden_mask, item_emb, unit_emb, value_emb = (
-            self.encode_rows(inputs)
+    def diagnosis_lookup(self, token_ids: torch.Tensor) -> torch.Tensor:
+        flat = self.diagnosis_embedding_matrix.index_select(
+            0, token_ids.reshape(-1).cpu()
         )
-        return self.ntp_head(
-            hidden_states=hidden_states,
-            attention_mask=hidden_mask,
-            target_item_emb=item_emb,
-            target_unit_emb=unit_emb,
-            target_value_text_emb=value_emb,
-            target_numeric_values=inputs["numeric_values"],
-            target_numeric_mask=inputs["numeric_mask"],
-            target_type_ids=inputs["type_ids"],
-            target_times=inputs["times"],
-        )
-
-    def forward_task(self, inputs):
-        hidden_states, hidden_mask, _, _, _ = self.encode_rows(inputs)
-        adapted = self.adapter(hidden_states, hidden_mask)
-        return self.forward_task_from_adapted(adapted, inputs)
-
-    def forward_task_from_adapted(self, adapted, inputs):
-        pooled = self.task_query_head(inputs["query_embeds"], adapted, None)
-        query_mask = inputs.get("query_mask")
-        if query_mask is not None:
-            query_mask = query_mask.to(pooled.device)
-        output_query_mask = inputs.get("output_query_mask")
-        if output_query_mask is None:
-            output_query_mask = query_mask
-        if output_query_mask is not None:
-            output_query_mask = output_query_mask.to(pooled.device)
-        task_type_ids = inputs.get("task_type_ids")
-        if task_type_ids is None:
-            task_type_ids = torch.zeros(
-                pooled.shape[:1], dtype=torch.long, device=pooled.device
-            )
-        else:
-            task_type_ids = task_type_ids.to(pooled.device)
-        labels = inputs["labels"].view(-1).to(pooled.dtype)
-        task_loss_mask = inputs.get("task_loss_mask")
-        if task_loss_mask is None:
-            task_loss_mask = torch.ones_like(labels, dtype=torch.bool, device=pooled.device)
-        else:
-            task_loss_mask = task_loss_mask.to(pooled.device).bool()
-        binary_mask = (task_type_ids == TASK_TYPE_BINARY) & task_loss_mask
-        multiclass_mask = (task_type_ids == TASK_TYPE_MULTICLASS) & task_loss_mask
-        classification_mask = binary_mask | multiclass_mask
-
-        task_logits = self.task_classifier(pooled)
-        pooled_primary = pooled[:, 0] if pooled.dim() == 3 else pooled
-        if pooled.dim() == 3 and output_query_mask is not None:
-            summary_mask = output_query_mask.to(pooled.dtype)
-            pooled_primary = (
-                pooled * summary_mask.unsqueeze(-1)
-            ).sum(dim=1) / summary_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        binary_logits = self.task_classifier(pooled_primary).reshape(-1)
-
-        loss_terms = []
-        if binary_mask.any():
-            binary_loss = query_classification_loss(
-                binary_logits[binary_mask],
-                labels[binary_mask],
-            )
-            loss_terms.append(binary_loss)
-        else:
-            binary_loss = pooled.sum() * 0.0
-
-        survival_logits = self.task_survival_head(pooled_primary)
-        tte_mask = (task_type_ids == TASK_TYPE_TTE) & task_loss_mask
-        if tte_mask.any():
-            survival_labels = inputs["survival_labels"].to(
-                survival_logits.device, survival_logits.dtype
-            )
-            max_bins = min(survival_logits.size(-1), survival_labels.size(-1))
-            hazards = F.softplus(survival_logits[tte_mask, :max_bins]).clamp_min(1e-8)
-            exposure = survival_labels[tte_mask, 0, :max_bins]
-            event_bins = survival_labels[tte_mask, 1, :max_bins]
-            stage_mask = survival_labels[tte_mask, 2, :max_bins]
-            sample_nll = (hazards * exposure - event_bins * torch.log(hazards)) * stage_mask
-            tte_loss = sample_nll.sum(dim=1).mean()
-            loss_terms.append(tte_loss)
-        else:
-            tte_loss = survival_logits.sum() * 0.0
-
-        if multiclass_mask.any():
-            multiclass_logits = task_logits[:, 2:] if task_logits.dim() == 2 else task_logits
-            multiclass_query_mask = (
-                output_query_mask[multiclass_mask, 2:]
-                if output_query_mask is not None and output_query_mask.dim() == 2
-                else None
-            )
-            multiclass_loss = query_classification_loss(
-                multiclass_logits[multiclass_mask],
-                labels[multiclass_mask].long(),
-                query_mask=multiclass_query_mask,
-            )
-            loss_terms.append(multiclass_loss)
-        else:
-            multiclass_loss = pooled.sum() * 0.0
-
-        loss = torch.stack(loss_terms).sum() if loss_terms else pooled.sum() * 0.0
-        return {
-            "loss": loss,
-            "binary_loss": binary_loss,
-            "tte_loss": tte_loss,
-            "multiclass_loss": multiclass_loss,
-            "logits": binary_logits,
-            "task_logits": task_logits,
-            "survival_logits": survival_logits,
-            "multiclass_logits": task_logits[:, 2:] if task_logits.dim() == 2 else task_logits,
-            "labels": labels,
-            "binary_mask": binary_mask,
-            "classification_mask": classification_mask,
-            "task_loss_mask": task_loss_mask,
-            "task_type_ids": task_type_ids,
-        }
-
-    def relation_vectors(self, dtype: torch.dtype, device: torch.device):
-        query_embeddings = self.query_embedding_matrix.to(
-            device=device, dtype=dtype
-        )
-        return F.normalize(self.relation_projection(query_embeddings), dim=-1)
-
-    def _delta_scales(self, global_values, global_mask):
-        configured_scales = self.phenotype_scales.to(
-            global_values.device, global_values.dtype
-        )
-        observed_count = global_mask.float().sum(dim=0)
-        safe_count = observed_count.clamp_min(1.0)
-        mean = (
-            global_values.masked_fill(~global_mask, 0.0).sum(dim=0)
-            / safe_count
-        )
-        centered = (global_values - mean).masked_fill(~global_mask, 0.0)
-        batch_scale = torch.sqrt(
-            centered.pow(2).sum(dim=0) / safe_count
-        ).clamp_min(1e-6)
-        return torch.where(configured_scales > 0, configured_scales, batch_scale)
-
-    @staticmethod
-    def _huber(error: torch.Tensor, delta: float):
-        abs_error = error.abs()
-        return torch.where(
-            abs_error <= delta,
-            0.5 * error.pow(2),
-            delta * (abs_error - 0.5 * delta),
-        )
-
-    def forward_metric(self, inputs):
-        phenotype_values = inputs["phenotype_values"]
-        phenotype_mask = inputs["phenotype_mask"]
-        table_inputs = {
-            key: value
-            for key, value in inputs.items()
-            if key
-            not in {
-                "phenotype_values",
-                "phenotype_mask",
-                "labels",
-                "task_type_ids",
-                "survival_labels",
-            }
-        }
-        hidden_states, hidden_mask, _, _, _ = self.encode_rows(table_inputs)
-        adapted = self.adapter(hidden_states, hidden_mask)
-        return self.forward_metric_from_adapted(
-            adapted, hidden_mask, phenotype_values, phenotype_mask
-        )
-
-    def forward_metric_from_adapted(
-        self, adapted, hidden_mask, phenotype_values, phenotype_mask
-    ):
-        pooled_mask = torch.ones(
-            adapted.shape[:2],
-            dtype=hidden_mask.dtype,
-            device=hidden_mask.device,
-        )
-        local_embeddings = self.metric_embeddings(adapted, pooled_mask)
-        return self.forward_metric_from_embeddings(
-            local_embeddings, phenotype_values, phenotype_mask
-        )
-
-    def metric_embeddings(self, adapted, pooled_mask):
-        return F.normalize(self.metric_pooling(adapted, pooled_mask), dim=-1)
-
-    def forward_metric_embeddings(self, inputs):
-        hidden_states, hidden_mask, _, _, _ = self.encode_rows(inputs)
-        adapted = self.adapter(hidden_states, hidden_mask)
-        pooled_mask = torch.ones(
-            adapted.shape[:2],
-            dtype=hidden_mask.dtype,
-            device=hidden_mask.device,
-        )
-        return self.metric_embeddings(adapted, pooled_mask)
-
-    def forward_metric_from_embeddings(
-        self, local_embeddings, phenotype_values, phenotype_mask
-    ):
-        global_embeddings = pml.all_gather_with_grad(local_embeddings)
-        global_values = pml.all_gather_tensor(
-            phenotype_values.to(
-                local_embeddings.device, local_embeddings.dtype
-            )
-        )
-        global_mask = pml.all_gather_tensor(
-            phenotype_mask.to(local_embeddings.device).bool()
-        )
-        local_values = phenotype_values.to(
-            local_embeddings.device, local_embeddings.dtype
-        )
-        local_mask = phenotype_mask.to(local_embeddings.device).bool()
-
-        delta_embeddings = global_embeddings.unsqueeze(0) - local_embeddings.unsqueeze(1)
-        scales = self._delta_scales(global_values, global_mask)
-        pair_mask = local_mask.unsqueeze(1) & global_mask.unsqueeze(0)
-        if self.min_pair_delta > 0:
-            true_delta = (
-                global_values.unsqueeze(0) - local_values.unsqueeze(1)
-            ) / scales.view(1, 1, -1)
-            pair_mask = pair_mask & (true_delta.abs() >= self.min_pair_delta)
-
-        local_batch_size = local_embeddings.size(0)
-        start = pml.gather_batch_start(local_batch_size, local_embeddings.device)
-        row_indices = torch.arange(local_batch_size, device=local_embeddings.device)
-        self_mask = torch.zeros(
-            local_batch_size,
-            global_embeddings.size(0),
-            dtype=torch.bool,
-            device=local_embeddings.device,
-        )
-        self_mask[row_indices, start + row_indices] = True
-        pair_mask = pair_mask & (~self_mask.unsqueeze(-1))
-
-        pair_count = pair_mask.float().sum()
-        global_pair_count = pair_count.detach().clone()
-        if pml.is_distributed():
-            dist.all_reduce(global_pair_count, op=dist.ReduceOp.SUM)
-        if global_pair_count.item() <= 0:
-            relations = self.relation_vectors(
-                local_embeddings.dtype, local_embeddings.device
-            )
-            zero = local_embeddings.sum() * 0.0 + relations.sum() * 0.0
-            return {
-                "loss": zero,
-                "loss_sum": zero.detach(),
-                "abs_error_sum": zero.detach(),
-                "squared_error_sum": zero.detach(),
-                "pair_count": pair_count.detach(),
-            }
-
-        active_phenotypes = pair_mask.any(dim=(0, 1))
-        relations = self.relation_vectors(
-            local_embeddings.dtype, local_embeddings.device
-        )
-        active_relations = relations[active_phenotypes]
-        if self.min_pair_delta > 0:
-            true_delta = true_delta[..., active_phenotypes]
-        else:
-            true_delta = (
-                global_values[..., active_phenotypes].unsqueeze(0)
-                - local_values[..., active_phenotypes].unsqueeze(1)
-            ) / scales[active_phenotypes].view(1, 1, -1)
-        pair_mask = pair_mask[..., active_phenotypes]
-        pair_mask_float = pair_mask.to(true_delta.dtype)
-        pred_delta = torch.einsum(
-            "bgd,qd->bgq", delta_embeddings, active_relations
-        )
-        projection_error = pred_delta - true_delta
-        pair_mask_float = pair_mask.to(projection_error.dtype)
-        valid_projection_error = projection_error[pair_mask]
-        projection_terms = self._huber(
-            valid_projection_error, self.huber_delta
-        )
-        projection_loss_sum = projection_terms.sum()
-        projection_loss = projection_loss_sum / pair_count.clamp_min(1.0)
-
-        # Keep every rank connected to the same encoder/relation graph even
-        # when its local pair mask is empty but another rank has valid pairs.
-        graph_anchor = projection_error.sum() * 0.0 + relations.sum() * 0.0
-        loss = self.projection_loss_weight * projection_loss + graph_anchor
-        loss_sum = self.projection_loss_weight * projection_loss_sum
-
-        if self.transe_loss_weight > 0:
-            transe_target = true_delta.unsqueeze(-1) * relations.view(
-                1, 1, active_relations.size(0), active_relations.size(1)
-            )
-            transe_error = delta_embeddings.unsqueeze(2) - transe_target
-            transe_terms = transe_error.pow(2).mean(dim=-1)
-            transe_loss_sum = (transe_terms * pair_mask_float).sum()
-            transe_loss = transe_loss_sum / pair_count.clamp_min(1.0)
-            loss = loss + self.transe_loss_weight * transe_loss
-            loss_sum = loss_sum + self.transe_loss_weight * transe_loss_sum
-
-        if self.relation_l2_weight > 0:
-            loss = loss + self.relation_l2_weight * relations.pow(2).mean()
-
-        abs_error_sum = valid_projection_error.abs().sum()
-        squared_error_sum = valid_projection_error.pow(2).sum()
-        return {
-            "loss": loss,
-            "loss_sum": loss_sum.detach(),
-            "abs_error_sum": abs_error_sum.detach(),
-            "squared_error_sum": squared_error_sum.detach(),
-            "pair_count": pair_count.detach(),
-        }
-
-    def forward_joint(self, inputs):
-        hidden_states, hidden_mask, item_emb, unit_emb, value_emb = self.encode_rows(
-            inputs
-        )
-        ntp_output = self.ntp_head(
-            hidden_states=hidden_states,
-            attention_mask=hidden_mask,
-            target_item_emb=item_emb,
-            target_unit_emb=unit_emb,
-            target_value_text_emb=value_emb,
-            target_numeric_values=inputs["numeric_values"],
-            target_numeric_mask=inputs["numeric_mask"],
-            target_type_ids=inputs["type_ids"],
-            target_times=inputs["times"],
-        )
-        adapted = self.adapter(hidden_states, hidden_mask)
-        task_output = self.forward_task_from_adapted(adapted, inputs)
-        metric_output = self.forward_metric_from_adapted(
-            adapted,
-            hidden_mask,
-            inputs["phenotype_values"],
-            inputs["phenotype_mask"],
-        )
-        raw_losses = {
-            "ntp": ntp_output.loss,
-            "task": task_output["loss"],
-            "metric": metric_output["loss"],
-        }
-        total, weighted_losses = self.loss_combiner(raw_losses)
-        return {
-            "loss": total,
-            "weighted_losses": weighted_losses,
-            "ntp_output": ntp_output,
-            "task_output": task_output,
-            "metric_output": metric_output,
-        }
-
-    def forward_joint_grad_cache(self, inputs):
-        hidden_states, hidden_mask, item_emb, unit_emb, value_emb = self.encode_rows(
-            inputs
-        )
-        ntp_output = self.ntp_head(
-            hidden_states=hidden_states,
-            attention_mask=hidden_mask,
-            target_item_emb=item_emb,
-            target_unit_emb=unit_emb,
-            target_value_text_emb=value_emb,
-            target_numeric_values=inputs["numeric_values"],
-            target_numeric_mask=inputs["numeric_mask"],
-            target_type_ids=inputs["type_ids"],
-            target_times=inputs["times"],
-        )
-        adapted = self.adapter(hidden_states, hidden_mask)
-        task_output = self.forward_task_from_adapted(adapted, inputs)
-        pooled_mask = torch.ones(
-            adapted.shape[:2],
-            dtype=hidden_mask.dtype,
-            device=hidden_mask.device,
-        )
-        return {
-            "ntp_output": ntp_output,
-            "task_output": task_output,
-            "metric_embeddings": self.metric_embeddings(adapted, pooled_mask),
-        }
+        return flat.to(
+            device=token_ids.device,
+            dtype=self.encoder.embedding.item_proj.weight.dtype,
+            non_blocking=True,
+        ).view(*token_ids.shape, flat.size(-1))
 
     def forward(
         self,
-        objective: str,
-        inputs: Optional[Dict[str, torch.Tensor]] = None,
-        losses: Optional[Dict[str, torch.Tensor]] = None,
+        objective,
+        batch,
+        return_loss: bool = True,
+        collect_metrics: bool = False,
+        **kwargs,
     ):
+        encoded = self.encode(batch)
         if objective == "ntp":
-            return self.forward_ntp(inputs)
-        if objective == "task":
-            return self.forward_task(inputs)
-        if objective == "metric":
-            return self.forward_metric(inputs)
-        if objective == "metric_embeddings":
-            return self.forward_metric_embeddings(inputs)
-        if objective == "metric_from_embeddings":
-            return self.forward_metric_from_embeddings(
-                inputs["embeddings"],
-                inputs["phenotype_values"],
-                inputs["phenotype_mask"],
+            ntp_output = self.ntp(
+                hidden_states=encoded[0],
+                attention_mask=encoded[1],
+                target_item_emb=encoded[2],
+                target_unit_emb=encoded[3],
+                target_value_text_emb=encoded[4],
+                target_numeric_embeddings=self.encoder.embedding.numeric_embedding(
+                    batch["numeric_values"], encoded[5]
+                ).detach(),
+                target_numeric_mask=batch["numeric_mask"],
+                target_type_ids=batch["type_ids"],
+                target_times=batch["times"],
             )
-        if objective == "joint":
-            return self.forward_joint(inputs)
-        if objective == "joint_grad_cache":
-            return self.forward_joint_grad_cache(inputs)
-        if objective == "combine":
-            total, weighted_losses = self.loss_combiner(losses)
-            return {
-                "loss": total,
-                "weighted_losses": weighted_losses,
-            }
-        raise ValueError(f"Unsupported objective: {objective}")
-
-
-class ResumeScheduleCallback(TrainerCallback):
-    """Use current CLI logging/save intervals after checkpoint resume."""
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        state.logging_steps = args.logging_steps
-        state.eval_steps = args.eval_steps
-        state.save_steps = args.save_steps
-        return control
-
-
-class JointPretrainingTrainer(Trainer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._component_sums = {
-            "ntp_loss": 0.0,
-            "ntp_time_loss": 0.0,
-            "task_loss": 0.0,
-            "task_binary_loss": 0.0,
-            "task_tte_loss": 0.0,
-            "task_multiclass_loss": 0.0,
-            "metric_loss": 0.0,
-        }
-        self._component_count = 0
-
-    def get_train_dataloader(self):
-        if not self.args.length_grouped_batching:
-            return super().get_train_dataloader()
-
-        if self.train_dataset is None:
-            raise ValueError("Training requires a train_dataset.")
-        if self.train_dataset.lengths is None:
-            raise ValueError(
-                "Length-grouped batching requires precomputed dataset lengths."
-            )
-
-        data_collator = self._get_collator_with_removed_columns(
-            self.data_collator,
-            description="Training",
-        )
-        seed = (
-            self.args.data_seed
-            if self.args.data_seed is not None
-            else self.args.seed
-        )
-        batch_sampler = BucketBatchSampler(
-            lengths=self.train_dataset.lengths,
-            local_batch_size=self._train_batch_size,
-            world_size=self.accelerator.num_processes,
-            bucket_count=self.args.length_bucket_count,
-            seed=seed,
-            drop_last=self.args.dataloader_drop_last,
-        )
-        dataloader_params = {
-            "collate_fn": data_collator,
-            "num_workers": self.args.dataloader_num_workers,
-            "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
-            "batch_sampler": batch_sampler,
-        }
-        if self.args.dataloader_num_workers > 0:
-            dataloader_params["prefetch_factor"] = (
-                self.args.dataloader_prefetch_factor
-            )
-            dataloader_params["worker_init_fn"] = partial(
-                seed_worker,
-                num_workers=self.args.dataloader_num_workers,
-                rank=self.args.process_index,
-            )
-
-        return self.accelerator.prepare(
-            DataLoader(self.train_dataset, **dataloader_params)
-        )
-
-    def create_scheduler(
-        self, num_training_steps: int, optimizer=None
-    ):
-        if self.lr_scheduler is None and str(self.args.lr_scheduler_type) == "cosine":
-            optimizer = self.optimizer if optimizer is None else optimizer
-            warmup_steps = self.args.get_warmup_steps(num_training_steps)
-            min_lr_ratio = float(self.args.min_lr_ratio)
-
-            def lr_lambda(current_step):
-                if current_step < warmup_steps:
-                    return float(current_step) / float(max(1, warmup_steps))
-                progress = float(current_step - warmup_steps) / float(
-                    max(1, num_training_steps - warmup_steps)
+            loss = ntp_output.loss
+            if collect_metrics:
+                next_mask = encoded[1][:, :-1].bool() & encoded[1][:, 1:].bool()
+                next_count = next_mask.sum()
+                next_numeric_mask = batch["numeric_mask"][:, 1:].bool()
+                numeric_target = self.encoder.embedding.numeric_embedding(
+                    batch["numeric_values"], encoded[5]
+                ).detach()[:, 1:]
+                numeric_value_mask = next_mask & next_numeric_mask
+                text_value_mask = next_mask & ~next_numeric_mask
+                current_times = batch["times"][:, :-1]
+                next_times = batch["times"][:, 1:]
+                time_mask = (
+                    next_mask
+                    & torch.isfinite(current_times)
+                    & torch.isfinite(next_times)
+                    & (current_times > 0)
+                    & (next_times > 0)
                 )
-                progress = min(max(progress, 0.0), 1.0)
-                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-                return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, lr_lambda
-            )
-            return self.lr_scheduler
-        return super().create_scheduler(num_training_steps, optimizer)
-
-    def _forward_objectives(self, model, inputs):
-        combined = model(objective="joint", inputs=inputs)
-        return (
-            combined,
-            combined["ntp_output"],
-            combined["task_output"],
-            combined["metric_output"],
-        )
-
-    @staticmethod
-    def _slice_batch(inputs, start, end, batch_size):
-        return {
-            key: (
-                value[start:end]
-                if torch.is_tensor(value)
-                and value.ndim > 0
-                and value.size(0) == batch_size
-                else value
-            )
-            for key, value in inputs.items()
-        }
-
-    def _record_components(self, ntp_output, task_output, metric_loss):
-        self._component_sums["ntp_loss"] += ntp_output.loss.detach().float().item()
-        self._component_sums["ntp_time_loss"] += (
-            ntp_output.time_loss.detach().float().item()
-        )
-        self._component_sums["task_loss"] += (
-            task_output["loss"].detach().float().item()
-        )
-        self._component_sums["task_binary_loss"] += (
-            task_output["binary_loss"].detach().float().item()
-        )
-        self._component_sums["task_tte_loss"] += (
-            task_output["tte_loss"].detach().float().item()
-        )
-        self._component_sums["task_multiclass_loss"] += (
-            task_output["multiclass_loss"].detach().float().item()
-        )
-        self._component_sums["metric_loss"] += metric_loss.detach().float().item()
-
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        if not self.args.grad_cache:
-            return super().training_step(model, inputs, num_items_in_batch)
-
-        model.train()
-        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
-            self.optimizer.train()
-        inputs = self._prepare_inputs(inputs)
-        batch_size = int(inputs["item_ids"].size(0))
-        micro_batch_size = min(
-            int(self.args.grad_cache_micro_batch_size), batch_size
-        )
-        embedding_micro_batch_size = min(
-            int(self.args.grad_cache_embedding_micro_batch_size), batch_size
-        )
-        chunks = [
-            (start, min(start + micro_batch_size, batch_size))
-            for start in range(0, batch_size, micro_batch_size)
-        ]
-        embedding_chunks = [
-            (start, min(start + embedding_micro_batch_size, batch_size))
-            for start in range(0, batch_size, embedding_micro_batch_size)
-        ]
-
-        cached_embeddings = []
-        with torch.no_grad():
-            for start, end in embedding_chunks:
-                chunk = self._slice_batch(inputs, start, end, batch_size)
-                with self.compute_loss_context_manager():
-                    embeddings = model(
-                        objective="metric_embeddings", inputs=chunk
-                    )
-                cached_embeddings.append(embeddings.detach())
-
-        cached_embeddings = torch.cat(cached_embeddings, dim=0).requires_grad_(True)
-        with self.compute_loss_context_manager():
-            metric_output = model(
-                objective="metric_from_embeddings",
-                inputs={
-                    "embeddings": cached_embeddings,
-                    "phenotype_values": inputs["phenotype_values"],
-                    "phenotype_mask": inputs["phenotype_mask"],
-                },
-            )
-            metric_loss = self.args.metric_loss_weight * metric_output["loss"]
-
-        using_deepspeed = (
-            self.accelerator.distributed_type == DistributedType.DEEPSPEED
-        )
-
-        def backward(loss, final=False):
-            if using_deepspeed and not final:
-                model.set_gradient_accumulation_boundary(is_boundary=False)
-                model.backward(loss, scale_wrt_gas=False)
-            else:
-                kwargs = {"scale_wrt_gas": False} if using_deepspeed else {}
-                self.accelerator.backward(loss, **kwargs)
-
-        backward(metric_loss)
-        embedding_grads = cached_embeddings.grad.detach()
-
-        ntp_total = metric_loss.new_zeros(())
-        task_total = metric_loss.new_zeros(())
-        component_totals = {
-            name: metric_loss.new_zeros(())
-            for name in (
-                "ntp_time_loss",
-                "task_binary_loss",
-                "task_tte_loss",
-                "task_multiclass_loss",
-            )
-        }
-        for chunk_idx, (start, end) in enumerate(chunks):
-            chunk = self._slice_batch(inputs, start, end, batch_size)
-            fraction = float(end - start) / float(batch_size)
-            with self.compute_loss_context_manager():
-                outputs = model(objective="joint_grad_cache", inputs=chunk)
-                ntp_output = outputs["ntp_output"]
-                task_output = outputs["task_output"]
-                ntp_loss = fraction * ntp_output.loss
-                task_loss = fraction * task_output["loss"]
-                proxy_loss = (
-                    outputs["metric_embeddings"] * embedding_grads[start:end]
-                ).sum()
-                chunk_loss = (
-                    self.args.ntp_loss_weight * ntp_loss
-                    + self.args.task_loss_weight * task_loss
-                    + proxy_loss
+                time_target = torch.log1p(
+                    (next_times - current_times).clamp_min(0.0)
                 )
-            backward(chunk_loss, final=chunk_idx == len(chunks) - 1)
-            ntp_total = ntp_total + ntp_loss.detach()
-            task_total = task_total + task_loss.detach()
-            component_totals["ntp_time_loss"] += (
-                fraction * ntp_output.time_loss.detach()
-            )
-            component_totals["task_binary_loss"] += (
-                fraction * task_output["binary_loss"].detach()
-            )
-            component_totals["task_tte_loss"] += (
-                fraction * task_output["tte_loss"].detach()
-            )
-            component_totals["task_multiclass_loss"] += (
-                fraction * task_output["multiclass_loss"].detach()
-            )
-
-        self._component_sums["ntp_loss"] += ntp_total.float().item()
-        self._component_sums["ntp_time_loss"] += component_totals[
-            "ntp_time_loss"
-        ].float().item()
-        self._component_sums["task_loss"] += task_total.float().item()
-        self._component_sums["task_binary_loss"] += component_totals[
-            "task_binary_loss"
-        ].float().item()
-        self._component_sums["task_tte_loss"] += component_totals[
-            "task_tte_loss"
-        ].float().item()
-        self._component_sums["task_multiclass_loss"] += component_totals[
-            "task_multiclass_loss"
-        ].float().item()
-        self._component_sums["metric_loss"] += (
-            metric_output["loss"].detach().float().item()
-        )
-        self._component_count += 1
-
-        total_loss = (
-            self.args.ntp_loss_weight * ntp_total
-            + self.args.task_loss_weight * task_total
-            + metric_loss.detach()
-        )
-        return total_loss.detach()
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        outputs = self._forward_objectives(model, inputs)
-        combined, ntp_output, task_output, metric_output = outputs
-        self._record_components(ntp_output, task_output, metric_output["loss"])
-        self._component_count += 1
-        return (combined["loss"], combined) if return_outputs else combined["loss"]
-
-    def log(self, logs, start_time=None):
-        if self._component_count > 0:
-            logs = dict(logs)
-            for name, total in self._component_sums.items():
-                logs[name] = total / self._component_count
-            self._component_sums = {name: 0.0 for name in self._component_sums}
-            self._component_count = 0
-        super().log(logs, start_time=start_time)
-
-    def evaluate(
-        self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"
-    ):
-        dataloader = self.get_eval_dataloader(
-            eval_dataset if eval_dataset is not None else self.eval_dataset
-        )
-        self.model.eval()
-        totals = torch.zeros(12, dtype=torch.float64, device=self.args.device)
-        task_logits = []
-        task_labels = []
-
-        for inputs in tqdm(
-            dataloader,
-            desc=f"Eval step {self.state.global_step}",
-            disable=not pml.is_rank0(),
-            dynamic_ncols=True,
-            leave=False,
-        ):
-            inputs = self._prepare_inputs(inputs)
-            with torch.no_grad():
-                combined, ntp_output, task_output, metric_output = (
-                    self._forward_objectives(self.model, inputs)
-                )
-            totals[0] += combined["loss"].double()
-            totals[1] += ntp_output.loss.double()
-            totals[2] += task_output["loss"].double()
-            totals[3] += metric_output["loss_sum"].double()
-            totals[4] += metric_output["abs_error_sum"].double()
-            totals[5] += metric_output["squared_error_sum"].double()
-            totals[6] += metric_output["pair_count"].double()
-            totals[7] += ntp_output.time_loss.double()
-            totals[8] += task_output["binary_loss"].double()
-            totals[9] += task_output["tte_loss"].double()
-            totals[10] += 1
-            totals[11] += task_output["multiclass_loss"].double()
-
-            gathered_logits, gathered_labels, gathered_binary_mask = (
-                self.accelerator.gather_for_metrics(
-                    (
-                        task_output["logits"].detach(),
-                        task_output["labels"].detach(),
-                        task_output["binary_mask"].detach(),
-                    )
-                )
-            )
-            gathered_binary_mask = gathered_binary_mask.bool()
-            if gathered_binary_mask.any():
-                task_logits.append(gathered_logits[gathered_binary_mask].float().cpu())
-                task_labels.append(gathered_labels[gathered_binary_mask].float().cpu())
-
-        if pml.is_distributed():
-            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-
-        batch_count = max(float(totals[10].item()), 1.0)
-        pair_count = max(float(totals[6].item()), 1.0)
-        metrics = {
-            f"{metric_key_prefix}_loss": float(totals[0].item() / batch_count),
-            f"{metric_key_prefix}_ntp_loss": float(
-                totals[1].item() / batch_count
-            ),
-            f"{metric_key_prefix}_ntp_time_loss": float(
-                totals[7].item() / batch_count
-            ),
-            f"{metric_key_prefix}_task_loss": float(
-                totals[2].item() / batch_count
-            ),
-            f"{metric_key_prefix}_task_binary_loss": float(
-                totals[8].item() / batch_count
-            ),
-            f"{metric_key_prefix}_task_tte_loss": float(
-                totals[9].item() / batch_count
-            ),
-            f"{metric_key_prefix}_task_multiclass_loss": float(
-                totals[11].item() / batch_count
-            ),
-            f"{metric_key_prefix}_metric_loss": float(
-                totals[3].item() / pair_count
-            ),
-            f"{metric_key_prefix}_metric_mae": float(
-                totals[4].item() / pair_count
-            ),
-            f"{metric_key_prefix}_metric_rmse": float(
-                math.sqrt(totals[5].item() / pair_count)
-            ),
-            f"{metric_key_prefix}_metric_pair_count": float(totals[6].item()),
-        }
-        if task_logits:
-            classification = compute_classification_metrics(
-                EvalPrediction(
-                    predictions=torch.cat(task_logits).numpy(),
-                    label_ids=torch.cat(task_labels).numpy(),
-                )
-            )
-            metrics.update(
-                {
-                    f"{metric_key_prefix}_task_{name}": value
-                    for name, value in classification.items()
+                metric_payload = {
+                    "objective": "ntp",
+                    "sums": {
+                        "category_loss_sum": ntp_output.category_loss * next_count,
+                        "item_loss_sum": ntp_output.item_loss * next_count,
+                        "unit_loss_sum": ntp_output.unit_loss * next_count,
+                        "value_loss_sum": ntp_output.value_loss * next_count,
+                        "time_loss_sum": ntp_output.time_loss * time_mask.sum(),
+                        "category_accuracy_sum": (
+                            ntp_output.category_logits.argmax(dim=-1)
+                            == batch["type_ids"][:, 1:]
+                        )[next_mask].float().sum(),
+                        "item_cosine_similarity_sum": F.cosine_similarity(
+                            ntp_output.item_pred.float(), encoded[2][:, 1:].float(), dim=-1
+                        )[next_mask].sum(),
+                        "unit_cosine_similarity_sum": F.cosine_similarity(
+                            ntp_output.unit_pred.float(), encoded[3][:, 1:].float(), dim=-1
+                        )[next_mask].sum(),
+                        "value_cosine_similarity_sum": F.cosine_similarity(
+                            ntp_output.numeric_value_pred.float(),
+                            numeric_target.float(),
+                            dim=-1,
+                        )[numeric_value_mask].sum()
+                        + F.cosine_similarity(
+                            ntp_output.value_text_pred.float(),
+                            encoded[4][:, 1:].float(),
+                            dim=-1,
+                        )[text_value_mask].sum(),
+                        "time_log_mae_sum": (
+                            ntp_output.time_delta_pred.float() - time_target.float()
+                        ).abs()[time_mask].sum(),
+                    },
+                    "counts": {
+                        "category_loss_count": next_count,
+                        "item_loss_count": next_count,
+                        "unit_loss_count": next_count,
+                        "value_loss_count": next_count,
+                        "time_loss_count": time_mask.sum(),
+                        "category_accuracy_count": next_count,
+                        "item_cosine_similarity_count": next_count,
+                        "unit_cosine_similarity_count": next_count,
+                        "value_cosine_similarity_count": next_count,
+                        "time_log_mae_count": time_mask.sum(),
+                    },
                 }
+        elif objective == "pml":
+            pml_result = self.pml(
+                self.adapter(encoded[0], encoded[1]),
+                batch["query_ids"],
+                batch["target_deltas"],
+                return_predictions=collect_metrics,
             )
-
-        if pml.is_rank0():
-            print(
-                f"[Eval] step={self.state.global_step} "
-                + " ".join(f"{key}={value:.4f}" for key, value in metrics.items())
+            if collect_metrics:
+                loss, predicted_deltas = pml_result
+                metric_payload = {
+                    "objective": "pml",
+                    "predictions": predicted_deltas,
+                    "targets": batch["target_deltas"],
+                }
+            else:
+                loss = pml_result
+        elif objective == "sft":
+            sft_result = self.sft(
+                self.adapter(encoded[0], encoded[1]),
+                batch["query_embeddings"],
+                batch["query_mask"],
+                batch["task_type_ids"],
+                batch["labels"],
+                batch["survival_labels"],
+                batch["multilabel_labels"],
+                self.diagnosis_lookup(batch["candidate_text_ids"]),
+                batch["candidate_mask"],
+                batch["candidate_labels"],
+                return_outputs=collect_metrics,
             )
-        self.log(metrics)
-        self.control = self.callback_handler.on_evaluate(
-            self.args, self.state, self.control, metrics
-        )
-        self.model.train()
-        return metrics
-
-
-def embedding_cache_paths(data_args):
-    paths = []
-    for dataset_name in data_args.dataset:
-        if dataset_name == "mimic_iv":
-            paths.extend(data_args.table_text_embedding)
-        elif dataset_name == "eicu":
-            paths.extend(data_args.eicu_table_text_embedding)
-        elif dataset_name == "ehrshot":
-            paths.extend(data_args.ehrshot_table_text_embedding)
+            if collect_metrics:
+                loss, predictions = sft_result
+                metric_payload = {
+                    "objective": "sft",
+                    "task_ids": batch["task_ids"],
+                    "task_type_ids": batch["task_type_ids"],
+                    "labels": batch["labels"],
+                    "survival_labels": batch["survival_labels"],
+                    "multilabel_labels": batch["multilabel_labels"],
+                    "candidate_mask": batch["candidate_mask"],
+                    "candidate_labels": batch["candidate_labels"],
+                    **predictions,
+                }
+            else:
+                loss = sft_result
         else:
-            raise ValueError(f"Unsupported dataset: {dataset_name}")
-    return paths
+            raise ValueError(f"Unknown pretraining objective: {objective}")
+        outputs = {"loss": loss}
+        if collect_metrics:
+            outputs["metric_payload"] = metric_payload
+        return outputs
 
 
-def load_cached_query_names(cache_root: str):
-    task_names = set()
-    content_task_names = set()
-    for split in ("train", "val"):
-        manifest_path = os.path.join(cache_root, split, "manifest.json")
-        if not os.path.exists(manifest_path):
-            raise FileNotFoundError(
-                f"EHR encoder pretraining manifest not found: {manifest_path}. "
-                "Run scripts/preprocess/build_unified_pretrain_cache.sh first."
-            )
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-        task_names.update(str(task_name) for task_name in manifest.get("task_names", []))
-        content_task_names.update(
-            str(task_name)
-            for task_name in manifest.get(
-                "content_task_names", manifest.get("task_names", [])
-            )
-        )
-    return sorted(task_names), sorted(content_task_names)
+@dataclass
+class DataArguments:
+    dataset: list[str] = field(default_factory=lambda: ["mimic_iv", "eicu"])
+    root_dir: str = field(default="/data/zikun_workspace/mimic-iv-3.1_tabular")
+    eicu_root_dir: str = field(default="/data/zikun_workspace/eicu-crd")
+    eicu_raw_dir: str = field(default="/data/EHR_data_public/eicu-crd/2.0")
+    eicu_processed_dir: str = field(default="/data/zikun_workspace/eicu-crd/processed")
+    task_train_sample_info_path: str = field(default="/data/zikun_workspace/input/tasks/classification/mimic_iv/train")
+    task_val_sample_info_path: str = field(default="/data/zikun_workspace/input/tasks/classification/mimic_iv/val")
+    eicu_task_train_sample_info_path: str = field(default="/data/zikun_workspace/eicu-crd/processed/sample_info_train.json")
+    eicu_task_val_sample_info_path: str = field(default="/data/zikun_workspace/eicu-crd/processed/sample_info_val.json")
+    pretraining_sample_info_path: str = field(default="/data/zikun_workspace/input/tasks/classification/mimic_iv/train/next_token_prediction.csv")
+    pretraining_val_sample_info_path: str = field(default="/data/zikun_workspace/input/tasks/classification/mimic_iv/val/next_token_prediction.csv")
+    eicu_pretraining_sample_info_path: str = field(default="/data/zikun_workspace/eicu-crd/processed/pretraining_index/sample_info_train.json")
+    eicu_pretraining_val_sample_info_path: str = field(default="/data/zikun_workspace/eicu-crd/processed/pretraining_index/sample_info_val.json")
+    tte_index_dir: str = field(default="/data/zikun_workspace/input/tasks/time_to_event")
+    table_embedding_cache: str = field(default="/data/zikun_workspace/input/cache/embeddings/merged_table_embeddings.pt")
+    task_query_embedding_cache: str = field(default="/data/zikun_workspace/input/cache/query_embeddings/pretraining/task_query_knowledge_embeddings.pt")
+    phenotype_query_embedding_cache: str = field(default="/data/zikun_workspace/input/cache/query_embeddings/pretraining/phenotype_query_knowledge_embeddings.pt")
+    diagnosis_embedding_cache: str = field(default="/data/zikun_workspace/input/cache/embeddings/mimic_iv/diagnosis_text_embeddings.pt")
+    phenotype_pair_count_path: str = field(default="/data/zikun_workspace/input/cache/pretraining/phenotype_metric_learning/phenotype_pair_counts.csv")
+    runtime_index_path: str = field(default="/data/zikun_workspace/input/cache/pretraining/runtime_index.sqlite")
+    rebuild_runtime_index: bool = field(default=False)
+    runtime_index_num_workers: int = field(default=96)
+    max_pretraining_records: Optional[int] = field(default=None)
+    type_vocab_file: str = field(default="/data/zikun_workspace/code/data/type_vocab.json")
+    max_table_len: int = field(default=4096)
+    ntp_stride: Optional[int] = field(default=3000)
+    max_eval_samples: Optional[int] = field(default=10000)
+    sft_include_tte: bool = field(default=True)
+    sft_recent_token_ratio: float = field(default=0.75)
+    initialization_checkpoint: Optional[str] = field(default=None)
+
+    def __post_init__(self):
+        if not 0.0 <= self.sft_recent_token_ratio <= 1.0:
+            raise ValueError("sft_recent_token_ratio must be between 0 and 1.")
 
 
-def load_cached_task_num_classes(cache_root: str, task_names: List[str]) -> List[int]:
-    task_info = tqc.get_task_info()
-    num_classes = {
-        task_name: int(task_info.get(task_name, {}).get("num_classes", 1))
-        for task_name in task_names
-    }
-    for split in ("train", "val"):
-        manifest_path = os.path.join(cache_root, split, "manifest.json")
-        if not os.path.exists(manifest_path):
-            continue
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-        manifest_task_names = list(manifest.get("task_names", []))
-        manifest_num_classes = list(
-            manifest.get("task_num_classes", [1] * len(manifest_task_names))
-        )
-        for task_name, class_count in zip(manifest_task_names, manifest_num_classes):
-            num_classes[str(task_name)] = int(class_count)
-    return [max(1, int(num_classes.get(task_name, 1))) for task_name in task_names]
-
-
-def task_class_labels(task_name: str, task_info: Dict[str, dict]) -> Optional[List[str]]:
-    info = task_info.get(task_name)
-    if not info:
-        return None
-    if info.get("task_type") not in {"binary_classification", "multi_class_classification"}:
-        return None
-    return tqc.class_labels_for_task(info)
-
-
-def build_task_class_query_tensors(
-    task_names: List[str],
-    task_info: Dict[str, dict],
-    task_query_embeddings: Dict[str, torch.Tensor],
-    query_dim: int,
-):
-    labels_by_task = {
-        task_name: task_class_labels(task_name, task_info)
-        for task_name in task_names
-    }
-    max_queries = max(
-        [1, *[len(labels) for labels in labels_by_task.values() if labels]]
+@dataclass
+class PretrainingArguments(TrainingArguments):
+    output_dir: str = field(default="/data/zikun_workspace/checkpoints/pretraining/basic_joint_pretrain")
+    num_train_epochs: float = field(default=1.0)
+    remove_unused_columns: bool = field(default=False)
+    prediction_loss_only: bool = field(default=True)
+    objectives: list[str] = field(
+        default_factory=lambda: list(PRETRAINING_OBJECTIVES)
     )
-    query_embeddings = torch.zeros(
-        len(task_names), max_queries, query_dim, dtype=torch.float
-    )
-    query_mask = torch.zeros(len(task_names), max_queries, dtype=torch.float)
+    ntp_ratio: int = field(default=5)
+    pml_ratio: int = field(default=3)
+    sft_ratio: int = field(default=2)
+    ntp_time_loss_weight: float = field(default=0.1)
+    pml_huber_delta: float = field(default=1.0)
+    wandb_project: Optional[str] = field(default="Joint_Pretraining")
+    resume_from_checkpoint: Optional[str] = field(default=None)
 
-    for task_idx, task_name in enumerate(task_names):
-        class_labels = labels_by_task.get(task_name)
-        if not class_labels:
-            continue
-        if task_info[task_name].get("task_type") == "binary_classification":
-            keys = [task_name]
-        else:
-            keys = [tqc.class_query_key(task_name, class_label) for class_label in class_labels]
-        for query_idx, key in enumerate(keys):
-            query_embeddings[task_idx, query_idx] = task_query_embeddings[key].float()
-            query_mask[task_idx, query_idx] = 1.0
-    return query_embeddings, query_mask
+    def __post_init__(self):
+        super().__post_init__()
+        self.objectives = list(normalize_objectives(self.objectives))
+        ratios = (self.ntp_ratio, self.pml_ratio, self.sft_ratio)
+        if any(ratio <= 0 for ratio in ratios):
+            raise ValueError("Pretraining objective ratios must be positive.")
+        if self.wandb_project:
+            os.environ["WANDB_PROJECT"] = self.wandb_project
+
+
+def load_embedding_cache(path: str):
+    cache = torch.load(path, map_location="cpu", weights_only=False)
+    return cache["embeddings"], int(cache["text_dim"])
 
 
 def main():
-    parser = HfArgumentParser((DataArguments, PretrainingArguments))
-    data_args, training_args = parser.parse_args_into_dataclasses()
-    pretraining_input_dir = (
-        data_args.unified_preprocessed_input_dir
-        or data_args.pretraining_input_dir
-    )
-    os.environ.setdefault("MIMIC_SKIP_SAMPLE_CACHE_CHECK", "1")
-    set_seed(training_args.seed)
-
-    text_dim, text_to_idx, embedding_matrix = pml.load_table_embeddings(
-        embedding_cache_paths(data_args),
-        merged_cache_path=data_args.merged_table_embedding_cache,
-    )
-    pml.rank0_print("Table embeddings ready.", flush=True)
-    type_vocab = pml.load_type_vocab(data_args.type_vocab_file)
-    task_names, content_task_names = load_cached_query_names(
-        pretraining_input_dir
-    )
-    task_num_classes = load_cached_task_num_classes(
-        pretraining_input_dir,
-        task_names,
-    )
-    task_info = tqc.get_task_info()
-    task_query_texts = {}
-    for task_name in task_names:
-        info = task_info.get(task_name)
-        task_query_texts[task_name] = (
-            info.get("instruction")
-            if info and info.get("instruction")
-            else "Self-supervised pretraining context from one hospital encounter."
-        )
-        if not info or info.get("task_type") not in {"binary_classification", "multi_class_classification"}:
-            continue
-        task_query_texts.update(tqc.build_class_query_texts(task_name, info))
-    task_query_texts.update(FORMAT_QUERY_TEXTS)
-    pml.rank0_print(
-        f"Loading task query embeddings: {len(task_query_texts)} texts.",
-        flush=True,
-    )
-    task_query_embeddings = pml.build_knowledge_query_embeddings(
-        query_texts=task_query_texts,
-        cache_path=data_args.task_query_embedding_cache,
-        model_path=data_args.knowledge_encoder_path,
-        base_model_path=data_args.knowledge_encoder_base_model_path,
-        max_length=data_args.query_max_length,
-        batch_size=data_args.query_embedding_batch_size,
-    )
-    pml.rank0_print("Task query embeddings ready.", flush=True)
-
-    phenotype_specs = pml.load_query_specs(data_args.phenotype_spec_path)
-    phenotype_query_texts = {
-        spec.key: spec.query_text for spec in phenotype_specs
-    }
-    pml.rank0_print(
-        f"Loading phenotype query embeddings: {len(phenotype_query_texts)} texts.",
-        flush=True,
-    )
-    phenotype_query_embeddings = pml.build_knowledge_query_embeddings(
-        query_texts=phenotype_query_texts,
-        cache_path=data_args.phenotype_query_embedding_cache,
-        model_path=data_args.knowledge_encoder_path,
-        base_model_path=data_args.knowledge_encoder_base_model_path,
-        max_length=data_args.query_max_length,
-        batch_size=data_args.query_embedding_batch_size,
-    )
-    pml.rank0_print("Phenotype query embeddings ready.", flush=True)
-    phenotype_query_embedding_matrix = torch.stack(
-        [phenotype_query_embeddings[spec.key] for spec in phenotype_specs],
-        dim=0,
-    )
-    phenotype_scales = torch.tensor(
-        [
-            (
-                float(spec.scale)
-                if spec.scale is not None and float(spec.scale) > 0
-                else 0.0
-            )
-            for spec in phenotype_specs
-        ],
-        dtype=torch.float,
-    )
-    task_query_dim = int(next(iter(task_query_embeddings.values())).numel())
-    phenotype_query_dim = int(phenotype_query_embedding_matrix.size(-1))
-    if phenotype_query_dim != task_query_dim:
+    data_args, training_args = HfArgumentParser(
+        (DataArguments, PretrainingArguments)
+    ).parse_args_into_dataclasses()
+    if data_args.initialization_checkpoint and training_args.resume_from_checkpoint:
         raise ValueError(
-            "Task and phenotype query embedding dimensions must match for "
-            f"joint pretraining: task={task_query_dim}, "
-            f"phenotype={phenotype_query_dim}"
+            "Use --initialization_checkpoint for a new stage or "
+            "--resume_from_checkpoint within the same stage, not both."
         )
-    task_class_query_embeddings, task_class_query_mask = build_task_class_query_tensors(
-        task_names=task_names,
-        task_info=task_info,
-        task_query_embeddings=task_query_embeddings,
-        query_dim=task_query_dim,
+    set_seed(training_args.seed)
+    active_objectives = tuple(training_args.objectives)
+    joint_training = set(active_objectives) == set(PRETRAINING_OBJECTIVES)
+    needs_context = any(name in active_objectives for name in ("ntp", "pml"))
+    needs_sft = "sft" in active_objectives
+    table_cache = torch.load(
+        data_args.table_embedding_cache, map_location="cpu", weights_only=False
     )
-    config = LongTableEncoder1DConfig(
-        text_dim=text_dim,
-        type_vocab_size=max(type_vocab.values()) + 1,
-        max_table_len=data_args.max_table_len,
-        dim_out=task_query_dim,
-        activation_checkpointing=training_args.activation_checkpointing,
-    )
-    model = JointPretrainingModel(
-        config=config,
-        embedding_matrix=embedding_matrix,
-        phenotype_query_embedding_matrix=phenotype_query_embedding_matrix,
-        phenotype_scales=phenotype_scales,
-        task_num_classes=task_num_classes,
-        training_args=training_args,
-    )
+    table_embeddings = table_cache["embedding_matrix"].float()
+    text_to_idx = {str(key): int(value) for key, value in table_cache["text_to_idx"].items()}
+    with open(data_args.type_vocab_file, "r", encoding="utf-8") as file:
+        type_vocab = {str(key): int(value) for key, value in json.load(file).items()}
+    tensorize = TableTensorizer(text_to_idx, type_vocab)
 
-    train_dataset = PreprocessedPretrainingTaskDataset(
-        cache_root=pretraining_input_dir,
-        split="train",
-        task_query_embeddings=task_query_embeddings,
-        phenotype_specs=phenotype_specs,
-        text_to_idx=text_to_idx,
-        max_table_len=data_args.max_table_len,
-        build_lengths=training_args.length_grouped_batching,
+    rank0_print(
+        f"[1/5] Loading metadata for objectives: {', '.join(active_objectives)}"
     )
-    eval_dataset = PreprocessedPretrainingTaskDataset(
-        cache_root=pretraining_input_dir,
-        split="val",
-        task_query_embeddings=task_query_embeddings,
-        phenotype_specs=phenotype_specs,
-        text_to_idx=text_to_idx,
-        max_table_len=data_args.max_table_len,
-    )
-    collator = PreprocessedUnifiedTaskCollator(
-        task_query_embeddings=task_query_embeddings,
-        task_names=task_names,
-        format_query_embeddings=task_query_embeddings,
-        task_class_query_embeddings=task_class_query_embeddings,
-        task_class_query_mask=task_class_query_mask,
-        max_table_len=data_args.max_table_len,
-        min_table_rows=data_args.min_table_rows,
-    )
-
-    pml.rank0_print(
-        f"Unified cached train/val: {len(train_dataset)}/{len(eval_dataset)}"
-    )
-    pml.rank0_print(
-        f"Task queries: instructions={len(task_names)}, "
-        f"content={len(content_task_names)}, formats=3"
-    )
-    pml.rank0_print(f"Knowledge query dimension: {task_query_dim}")
-    pml.rank0_print(f"Phenotype metric queries: {len(phenotype_specs)}")
-    if training_args.length_grouped_batching:
-        pml.rank0_print(
-            "Bucket batch sampling enabled: "
-            f"{training_args.length_bucket_count} buckets, "
-            "global batches split across ranks."
-        )
-    if training_args.text_embedding_on_gpu:
-        pml.rank0_print("BF16 text embedding matrix will reside on each GPU.")
-
-    eval_strategy = str(training_args.eval_strategy).lower()
-    callbacks = [ResumeScheduleCallback()]
-    if not eval_strategy.endswith("no"):
-        callbacks.append(
-            EarlyStoppingCallback(
-                early_stopping_patience=training_args.early_stopping_patience
+    train_context = val_context = None
+    runtime_index_path = data_args.runtime_index_path
+    if needs_context:
+        train_context = build_context_records(data_args, "train")
+        val_context = build_context_records(data_args, "val")
+        if data_args.max_pretraining_records is not None:
+            train_context = LimitedRecordDataset(
+                train_context, data_args.max_pretraining_records
             )
+            val_context = LimitedRecordDataset(
+                val_context, data_args.max_pretraining_records
+            )
+            runtime_index_path = (
+                f"{data_args.runtime_index_path}.debug_"
+                f"{data_args.max_pretraining_records}.sqlite"
+            )
+
+    train_sft_records = val_sft_records = None
+    task_names = []
+    task_num_classes = []
+    task_to_id = {}
+    if needs_sft:
+        train_sft_records = build_sft_records(data_args, "train")
+        val_sft_records = build_sft_records(data_args, "val")
+        task_names = sorted(
+            set(train_sft_records.task_names) | set(val_sft_records.task_names)
         )
-    trainer = JointPretrainingTrainer(
+        task_num_classes = [
+            1
+            if task_info_for(name).get("sft_target") == "sampled_candidates"
+            else int(task_info_for(name).get("num_classes", 1))
+            for name in task_names
+        ]
+        task_to_id = {name: index for index, name in enumerate(task_names)}
+
+    task_queries, query_dim = load_embedding_cache(data_args.task_query_embedding_cache)
+    if needs_sft:
+        task_query_bank, task_query_mask = build_task_query_bank(
+            task_names, task_num_classes, task_queries
+        )
+    else:
+        task_query_bank = torch.empty(0, 2, query_dim)
+        task_query_mask = torch.empty(0, 2, dtype=torch.bool)
+    specs = load_balanced_phenotype_specs(data_args.phenotype_pair_count_path)
+    if needs_context:
+        rank0_print("[2/5] Building or loading the shared NTP/PML runtime index")
+        ensure_runtime_index(
+            path=runtime_index_path,
+            records_by_split={"train": train_context, "val": val_context},
+            specs=specs,
+            source_paths=[
+                path
+                for path in (
+                    data_args.pretraining_sample_info_path,
+                    data_args.pretraining_val_sample_info_path,
+                    data_args.eicu_pretraining_sample_info_path,
+                    data_args.eicu_pretraining_val_sample_info_path,
+                    data_args.phenotype_pair_count_path,
+                )
+                if os.path.exists(path)
+            ],
+            max_table_len=data_args.max_table_len,
+            stride=data_args.ntp_stride,
+            rebuild=data_args.rebuild_runtime_index,
+            num_workers=data_args.runtime_index_num_workers,
+        )
+    else:
+        rank0_print("[2/5] Runtime index is not needed for SFT-only training")
+    phenotype_queries, phenotype_query_dim = load_embedding_cache(
+        data_args.phenotype_query_embedding_cache
+    )
+    if phenotype_query_dim != query_dim:
+        raise ValueError("Task and phenotype query dimensions differ.")
+    missing_phenotype_queries = [
+        spec["key"] for spec in specs if spec["key"] not in phenotype_queries
+    ]
+    if missing_phenotype_queries:
+        raise ValueError(
+            f"Phenotype query cache is missing {len(missing_phenotype_queries)} balanced queries. "
+            "Run preprocess/precompute_phenotype_queries.py before pretraining."
+        )
+    phenotype_query_matrix = torch.stack([phenotype_queries[spec["key"]].float() for spec in specs])
+    diagnosis_cache = torch.load(
+        data_args.diagnosis_embedding_cache, map_location="cpu", weights_only=False
+    )
+    if int(diagnosis_cache["text_dim"]) != query_dim:
+        raise ValueError("Diagnosis and task query embedding dimensions differ.")
+    diagnosis_items = [
+        (str(text), embedding.float())
+        for text, embedding in diagnosis_cache["embeddings"].items()
+    ]
+    diagnosis_text_to_idx = {
+        text: index for index, (text, _) in enumerate(diagnosis_items)
+    }
+    diagnosis_embedding_matrix = torch.stack(
+        [embedding for _, embedding in diagnosis_items]
+    )
+    del diagnosis_cache, diagnosis_items
+
+    config_root = data_args.initialization_checkpoint
+    if config_root and os.path.isfile(config_root):
+        config_root = os.path.dirname(config_root)
+    config_path = os.path.join(config_root, "config.json") if config_root else None
+    if config_path and os.path.isfile(config_path):
+        config = LongTableEncoder1DConfig.from_pretrained(config_root)
+        if int(config.text_dim) != int(table_cache["text_dim"]):
+            raise ValueError("Checkpoint and table embedding dimensions differ.")
+        if config.dim_out is not None and int(config.dim_out) != query_dim:
+            raise ValueError("Checkpoint and query embedding dimensions differ.")
+        config.max_table_len = data_args.max_table_len
+        config.activation_checkpointing = False
+    else:
+        config = LongTableEncoder1DConfig(
+            text_dim=int(table_cache["text_dim"]),
+            type_vocab_size=max(type_vocab.values()) + 1,
+            numeric_feature_keys=[],
+            max_table_len=data_args.max_table_len,
+            dim_out=query_dim,
+            activation_checkpointing=False,
+        )
+    model = JointPretrainingModel(
+        config,
+        table_embeddings,
+        phenotype_query_matrix,
+        diagnosis_embedding_matrix,
+        query_dim,
+        365,
+        training_args.ntp_time_loss_weight,
+        training_args.pml_huber_delta,
+    )
+    if data_args.initialization_checkpoint:
+        load_initialization_weights(model, data_args.initialization_checkpoint)
+
+    rank0_print("[3/5] Creating lazy objective datasets")
+    train_objectives = {}
+    eval_objectives = {}
+    if "ntp" in active_objectives:
+        train_objectives["ntp"] = SlidingWindowDataset(
+            train_context,
+            tensorize,
+            data_args.max_table_len,
+            data_args.ntp_stride,
+            windows=load_ntp_windows(runtime_index_path, "train"),
+        )
+        eval_objectives["ntp"] = SlidingWindowDataset(
+            val_context,
+            tensorize,
+            data_args.max_table_len,
+            data_args.ntp_stride,
+            windows=load_ntp_windows(runtime_index_path, "val"),
+        )
+    if "pml" in active_objectives:
+        train_objectives["pml"] = PhenotypePairDataset(
+            train_context,
+            tensorize,
+            specs,
+            pairs_per_item=6,
+            max_table_len=data_args.max_table_len,
+            seed=training_args.seed,
+            runtime_index_path=runtime_index_path,
+            split="train",
+        )
+        eval_objectives["pml"] = PhenotypePairDataset(
+            val_context,
+            tensorize,
+            specs,
+            pairs_per_item=6,
+            max_table_len=data_args.max_table_len,
+            seed=training_args.seed + 1,
+            runtime_index_path=runtime_index_path,
+            split="val",
+        )
+    if needs_sft:
+        train_objectives["sft"] = SFTDataset(
+            train_sft_records,
+            tensorize,
+            task_to_id,
+            data_args.max_table_len,
+            True,
+            diagnosis_text_to_idx,
+            training_args.seed,
+            data_args.sft_recent_token_ratio,
+        )
+        eval_objectives["sft"] = SFTDataset(
+            val_sft_records,
+            tensorize,
+            task_to_id,
+            data_args.max_table_len,
+            False,
+            diagnosis_text_to_idx,
+            training_args.seed,
+            data_args.sft_recent_token_ratio,
+        )
+
+    global_batch_size = (
+        training_args.per_device_train_batch_size * training_args.world_size
+    )
+    pairs_per_item = None
+    if joint_training:
+        ntp_steps = math.ceil(len(train_objectives["ntp"]) / global_batch_size)
+        _, desired_counts = build_objective_schedule(
+            ntp_steps,
+            training_args.ntp_ratio,
+            training_args.pml_ratio,
+            training_args.sft_ratio,
+            training_args.seed,
+        )
+        train_pml = train_objectives["pml"]
+        quota_multiple = math.lcm(
+            6,
+            global_batch_size // math.gcd(train_pml.item_count, global_batch_size),
+        )
+        desired_pairs_per_item = (
+            desired_counts["pml"] * global_batch_size / train_pml.item_count
+        )
+        pairs_per_item = max(
+            quota_multiple,
+            int(round(desired_pairs_per_item / quota_multiple)) * quota_multiple,
+        )
+        train_pml.set_pairs_per_item(pairs_per_item)
+        step_counts = {
+            "ntp": ntp_steps,
+            "pml": len(train_pml) // global_batch_size,
+            "sft": desired_counts["sft"],
+        }
+    else:
+        objective = active_objectives[0]
+        step_counts = {
+            objective: math.ceil(len(train_objectives[objective]) / global_batch_size)
+        }
+        if objective == "pml":
+            pairs_per_item = train_objectives["pml"].pairs_per_item
+
+    objective_schedule = interleave_objective_counts(step_counts, training_args.seed)
+    train_dataset = ScheduledObjectiveDataset(
+        train_objectives,
+        objective_schedule,
+        training_args.per_device_train_batch_size,
+        training_args.world_size,
+        training_args.seed,
+    )
+
+    if data_args.max_eval_samples:
+        for objective, dataset in eval_objectives.items():
+            if len(dataset) > data_args.max_eval_samples:
+                rng = np.random.default_rng(training_args.seed)
+                indices = np.sort(
+                    rng.choice(len(dataset), data_args.max_eval_samples, replace=False)
+                ).tolist()
+                eval_objectives[objective] = Subset(dataset, indices)
+    eval_dataset = {
+        objective: TaggedDataset(objective, dataset)
+        for objective, dataset in eval_objectives.items()
+    }
+
+    rank0_print("[4/5] Finalizing the objective schedule")
+    dataset_sizes = {name: len(dataset) for name, dataset in train_objectives.items()}
+    rank0_print(
+        f"Objectives={list(active_objectives)}; samples={dataset_sizes}; "
+        f"steps={step_counts}; PML pairs/item={pairs_per_item}; "
+        f"SFT tasks={len(task_names)}"
+    )
+    trainer = ObjectiveTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=collator,
-        callbacks=callbacks,
+        data_collator=ObjectiveCollator(task_query_bank, task_query_mask),
+        task_names=task_names,
+        task_infos=[task_info_for(name) for name in task_names],
     )
-    trainer.train(
-        resume_from_checkpoint=getattr(
-            training_args, "resume_from_checkpoint", None
-        )
-    )
+    rank0_print("[5/5] Starting DeepSpeed training")
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model(training_args.output_dir)
 
 

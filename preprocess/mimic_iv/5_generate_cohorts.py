@@ -117,6 +117,19 @@ def save_patients(subjects, splits, output_dir):
         df.to_csv(os.path.join(output_dir, f"{split}.csv"), index=False)
 
 
+def load_existing_splits(output_dir):
+    paths = {
+        split: os.path.join(output_dir, f"{split}.csv")
+        for split in ("train", "val", "test")
+    }
+    if not all(os.path.exists(path) for path in paths.values()):
+        return None
+    return {
+        split: pd.read_csv(path, dtype={"subject_id": str})
+        for split, path in paths.items()
+    }
+
+
 def split_task_indexes(splits, task_index_all_dir, task_index_output_dir):
     split_ids = {split: set(df["subject_id"]) for split, df in splits.items()}
     for split in splits:
@@ -144,11 +157,19 @@ def report(labels, splits):
 def main():
     args = parse_args()
     subjects = load_subjects(args)
-    labels = build_patient_labels(subjects, args.task_index_all_dir)
-    splits = split_patients(labels, args)
-    save_patients(subjects, splits, args.patient_output_dir)
+    splits = load_existing_splits(args.patient_output_dir)
+    labels = None
+    if splits is None:
+        labels = build_patient_labels(subjects, args.task_index_all_dir)
+        splits = split_patients(labels, args)
+        save_patients(subjects, splits, args.patient_output_dir)
     split_task_indexes(splits, args.task_index_all_dir, args.task_index_output_dir)
-    report(labels, splits)
+    if labels is not None:
+        report(labels, splits)
+    else:
+        print(f"patients: {len(subjects)}")
+        for split, split_df in splits.items():
+            print(f"{split}: {len(split_df)}")
 
 
 if __name__ == "__main__":

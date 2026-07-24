@@ -16,7 +16,8 @@
             "lr": "auto",
             "betas": "auto",
             "eps": "auto",
-            "weight_decay": "auto"
+            "weight_decay": "auto",
+            "torch_adam": true
         }
     },
     "zero_optimization": {
@@ -32,5 +33,5 @@
     "gradient_clipping": "auto",
     "train_batch_size": "auto",
     "train_micro_batch_size_per_gpu": "auto",
-    "find_unused_parameters": false
+    "find_unused_parameters": true
 }

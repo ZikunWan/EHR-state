@@ -8,7 +8,6 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from models.TableEncoder.config import LongTableEncoder1DConfig
-from models.TableEncoder.embedding import FourierFeatures
 from models.TableEncoder.encoder import LongTableEncoder1D
 
 
@@ -54,7 +53,7 @@ class NextTokenPredictionDecoder(nn.Module):
         hidden_dim: int,
         text_dim: int,
         type_vocab_size: int,
-        fourier_scales: list[float],
+        numeric_embedding_dim: int,
         category_loss_weight: float = 1.0,
         item_loss_weight: float = 1.0,
         value_loss_weight: float = 1.0,
@@ -67,11 +66,7 @@ class NextTokenPredictionDecoder(nn.Module):
         self.unit_head = nn.Linear(hidden_dim, text_dim)
         self.value_text_head = nn.Linear(hidden_dim, text_dim)
         self.time_delta_head = nn.Linear(hidden_dim, 1)
-        self.numeric_fourier = FourierFeatures(fourier_scales)
-        self.numeric_value_head = nn.Sequential(
-            nn.Linear(hidden_dim, self.numeric_fourier.output_dim),
-            nn.Tanh(),
-        )
+        self.numeric_value_head = nn.Linear(hidden_dim, numeric_embedding_dim)
 
         self.category_loss_weight = category_loss_weight
         self.item_loss_weight = item_loss_weight
@@ -99,7 +94,7 @@ class NextTokenPredictionDecoder(nn.Module):
         target_item_emb: torch.Tensor,
         target_unit_emb: torch.Tensor,
         target_value_text_emb: torch.Tensor,
-        target_numeric_values: torch.Tensor,
+        target_numeric_embeddings: torch.Tensor,
         target_numeric_mask: torch.Tensor,
         target_type_ids: torch.Tensor,
         target_times: Optional[torch.Tensor] = None,
@@ -119,7 +114,7 @@ class NextTokenPredictionDecoder(nn.Module):
         next_item_emb = target_item_emb[:, 1:, :]
         next_unit_emb = target_unit_emb[:, 1:, :]
         next_value_text_emb = target_value_text_emb[:, 1:, :]
-        next_numeric_values = target_numeric_values[:, 1:]
+        next_numeric_embeddings = target_numeric_embeddings[:, 1:, :]
         next_numeric_mask = target_numeric_mask[:, 1:].bool()
         next_type_ids = target_type_ids[:, 1:]
 
@@ -139,9 +134,9 @@ class NextTokenPredictionDecoder(nn.Module):
         # Unit uses the same embedding MSE loss.
         unit_loss = self._embedding_mse_loss(unit_pred, next_unit_emb, next_mask)
 
-        # Numeric values are compared in Fourier-feature space, while text
+        # Numeric values are compared in detached PLR(lite) embedding space, while text
         # values use the cached text-embedding space. Both become one Value loss.
-        numeric_value_target = self.numeric_fourier(next_numeric_values).to(numeric_value_pred.dtype)
+        numeric_value_target = next_numeric_embeddings.to(numeric_value_pred.dtype)
         value_text_loss_per_row = ((value_text_pred - next_value_text_emb.to(value_text_pred.dtype)) ** 2).mean(dim=-1)
         numeric_value_loss_per_row = ((numeric_value_pred - numeric_value_target) ** 2).mean(dim=-1)
         value_loss_per_row = torch.where(next_numeric_mask, numeric_value_loss_per_row, value_text_loss_per_row)
@@ -233,7 +228,7 @@ class NextTokenPredictionModel(PreTrainedModel):
             hidden_dim=config.dim,
             text_dim=config.text_dim,
             type_vocab_size=config.type_vocab_size,
-            fourier_scales=config.fourier_scales,
+            numeric_embedding_dim=config.numeric_embedding_dim,
             category_loss_weight=category_loss_weight,
             item_loss_weight=item_loss_weight,
             value_loss_weight=value_loss_weight,
@@ -289,6 +284,7 @@ class NextTokenPredictionModel(PreTrainedModel):
             times=times,
             numeric_values=numeric_values,
             numeric_mask=numeric_mask,
+            numeric_feature_ids=self.encoder.numeric_feature_ids(item_ids, unit_ids),
             seq_mask=seq_mask,
             type_ids=type_ids,
             return_mask=True,
@@ -300,7 +296,10 @@ class NextTokenPredictionModel(PreTrainedModel):
             target_item_emb=item_emb,
             target_unit_emb=unit_emb,
             target_value_text_emb=value_text_emb,
-            target_numeric_values=numeric_values,
+            target_numeric_embeddings=self.encoder.embedding.numeric_embedding(
+                numeric_values,
+                self.encoder.numeric_feature_ids(item_ids, unit_ids),
+            ).detach(),
             target_numeric_mask=numeric_mask,
             target_type_ids=type_ids,
             target_times=times,

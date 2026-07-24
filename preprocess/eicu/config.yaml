@@ -5,8 +5,8 @@ data_dir: "/data/EHR_data_public/eicu-crd/2.0"  # Directory containing raw eICU 
 output_dir: "/data/zikun_workspace/eicu-crd/processed"  # Output directory for processed files
 
 # External mapping files (for diagnosis task)
-ccs_path: "ccs_multi_dx_tool_2015.csv"  # CCS diagnosis mapping file (place in preprocess/eicu/)
-gem_path: "icd10cmtoicd9gem.csv"  # ICD-10 to ICD-9 GEM file (place in preprocess/eicu/)
+ccs_path: "preprocess/eicu/ccs_multi_dx_tool_2015.csv"
+gem_path: "preprocess/eicu/icd10cmtoicd9gem.csv"
 
 # Cohort filtering parameters
 min_age: 18  # Minimum age in years
@@ -31,7 +31,7 @@ tasks:
   - los_7day  # Length of stay > 7 days
   - final_acuity  # Final discharge destination
   - imminent_discharge  # Discharge within prediction window
-#  - diagnosis  # Multi-label CCS diagnoses (requires CCS mapping files)
+  - diagnosis  # Multi-label CCS diagnoses from GenHPF
   - creatinine  # Creatinine severity (0-4, SOFA-based)
   - bilirubin  # Bilirubin severity (0-4, SOFA-based)
   - platelets  # Platelet count severity (0-4, SOFA-based)

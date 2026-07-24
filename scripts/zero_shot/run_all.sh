@@ -3,58 +3,51 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 
+force=false
+if [[ "${1:-}" == "--force" ]]; then
+  force=true
+  shift
+fi
+if (($#)); then
+  echo "Usage: $0 [--force]" >&2
+  exit 2
+fi
+
 tasks=(
-  "pds.sh:severe_outcome"
-  "pds.sh:adverse_event_next_visit"
-  "renji.sh:ALB"
-  "renji.sh:ALP"
-  "renji.sh:CR"
-  "renji.sh:Glucose"
-  "renji.sh:HB"
-  "renji.sh:INR"
-  "renji.sh:N_Percent"
-  "renji.sh:PLT"
-  "renji.sh:PT"
-  "renji.sh:TP"
-  "renji.sh:Uric_Acid"
-  "renji.sh:WBC"
-  "renji_tte.sh:tacrolimus_abnormal"
-  "renji_tte.sh:death"
+  "ehrshot.sh:all"
 )
 
-gpu_ids=(0 1 2 3 4 5 6 7)
-free_gpus=("${gpu_ids[@]}")
-next_task=0
+result_complete() {
+  local script="$1" task="$2" input output
+  if [[ "${script}" == "ehrshot.sh" && "${task}" == "all" ]]; then
+    local classification_task
+    for classification_task in \
+      guo_los guo_readmission guo_icu \
+      lab_anemia lab_hyperkalemia lab_hyponatremia lab_hypoglycemia lab_thrombocytopenia \
+      new_acutemi new_celiac new_hyperlipidemia new_hypertension new_lupus new_pancan; do
+      result_complete "ehrshot.sh" "${classification_task}" || return 1
+    done
+    return 0
+  fi
+
+  input="/data/zikun_workspace/input/tasks/classification/ehrshot/test/${task}.csv"
+  output="/data/zikun_workspace/checkpoints/classification/ehrshot/${task}/zero_shot/test_results_${task}.csv"
+  [[ -s "${input}" && -s "${output}" ]] || return 1
+
+  [[ "$(wc -l < "${input}")" -eq "$(wc -l < "${output}")" ]]
+}
+
 failure=0
-declare -A pid_to_gpu=()
-
-while ((next_task < ${#tasks[@]} || ${#pid_to_gpu[@]} > 0)); do
-  while ((next_task < ${#tasks[@]} && ${#free_gpus[@]} > 0)); do
-    gpu="${free_gpus[0]}"
-    free_gpus=("${free_gpus[@]:1}")
-    IFS=: read -r script task <<< "${tasks[next_task]}"
-    echo "===== Starting zero-shot ${script} task=${task} on GPU ${gpu} ====="
-    bash "${script_dir}/${script}" "${task}" "${gpu}" &
-    pid=$!
-    pid_to_gpu["${pid}"]="${gpu}"
-    ((next_task += 1))
-  done
-
-  finished_pid=""
-  for pid in "${!pid_to_gpu[@]}"; do
-    if ! kill -0 "${pid}" 2>/dev/null \
-      || [[ "$(ps -o stat= -p "${pid}" 2>/dev/null | tr -d ' ')" == Z* ]]; then
-      if ! wait "${pid}"; then
-        failure=1
-      fi
-      free_gpus+=("${pid_to_gpu[${pid}]}")
-      unset "pid_to_gpu[${pid}]"
-      finished_pid="${pid}"
-      break
-    fi
-  done
-  if [[ -z "${finished_pid}" && ${#pid_to_gpu[@]} -gt 0 ]]; then
-    sleep 0.5
+for spec in "${tasks[@]}"; do
+  IFS=: read -r script task <<< "${spec}"
+  if [[ "${force}" == false ]] && result_complete "${script}" "${task}"; then
+    echo "===== Skipping completed ${script} task=${task} ====="
+    continue
+  fi
+  echo "===== Starting 8-GPU zero-shot ${script} task=${task} ====="
+  if ! bash "${script_dir}/${script}" "${task}"; then
+    echo "===== FAILED ${script} task=${task} =====" >&2
+    failure=1
   fi
 done
 

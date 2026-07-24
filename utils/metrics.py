@@ -5,6 +5,7 @@ from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     f1_score,
+    precision_recall_curve,
     recall_score,
     roc_auc_score,
 )
@@ -54,7 +55,21 @@ def calc_recall(y_true, y_pred, *, average="binary"):
     return recall_score(y_true, y_pred, average=average, zero_division=0)
 
 
-def compute_classification_metrics(eval_pred):
+def find_optimal_binary_threshold(y_true, y_prob):
+    y_true = np.asarray(y_true).reshape(-1).astype(int)
+    y_prob = np.asarray(y_prob).reshape(-1)
+    precision, recall, thresholds = precision_recall_curve(y_true, y_prob)
+    if thresholds.size == 0:
+        return 0.5, 0.0
+    f1 = 2.0 * precision[:-1] * recall[:-1] / np.maximum(
+        precision[:-1] + recall[:-1],
+        np.finfo(float).eps,
+    )
+    best_index = int(np.nanargmax(f1))
+    return float(thresholds[best_index]), float(f1[best_index])
+
+
+def compute_classification_metrics(eval_pred, binary_threshold=0.5):
     """
     Unified metric function for HuggingFace Trainer.
 
@@ -78,7 +93,7 @@ def compute_classification_metrics(eval_pred):
     # Binary classification: logits shape [N] or [N, 1]
     if logits.ndim == 1 or (logits.ndim == 2 and logits.shape[-1] == 1):
         probs = _sigmoid(logits.reshape(-1))
-        preds = (probs > 0.5).astype(int)
+        preds = (probs >= binary_threshold).astype(int)
 
         auroc = calc_auroc(y_true, probs)
         auprc = calc_auprc(y_true, probs)
@@ -97,7 +112,7 @@ def compute_classification_metrics(eval_pred):
     if logits.ndim == 2 and logits.shape[-1] == 2 and labels.ndim == 1:
         probs_2d = _softmax(logits, axis=-1)
         probs = probs_2d[:, 1]
-        preds = np.argmax(probs_2d, axis=-1).astype(int)
+        preds = (probs >= binary_threshold).astype(int)
 
         # In case labels are not exactly {0,1}, remap to {0,1} by sorted order.
         unique_labels = np.unique(y_true)
@@ -165,6 +180,21 @@ def compute_classification_metrics(eval_pred):
         "f1": f1,
         "recall": recall,
     }
+
+
+def compute_binary_metrics_at_optimal_f1(eval_pred):
+    logits = eval_pred.predictions
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    logits = np.asarray(logits)
+    if logits.ndim == 2 and logits.shape[-1] == 2:
+        probabilities = _softmax(logits, axis=-1)[:, 1]
+    else:
+        probabilities = _sigmoid(logits.reshape(-1))
+    threshold, _ = find_optimal_binary_threshold(eval_pred.label_ids, probabilities)
+    metrics = compute_classification_metrics(eval_pred, binary_threshold=threshold)
+    metrics["threshold"] = threshold
+    return metrics
 
 
 def compute_metrics(eval_pred):
@@ -477,7 +507,6 @@ def _stage_metrics(
     hazards_all = softplus(logits[:, :num_bins])
     times_all = np.sum(labels[:, 0, :num_bins], axis=1)
     events_all = np.sum(labels[:, 1, :num_bins], axis=1) > 0
-    stage_end_all = labels[:, 3, 0]
     event_times = times_all[events_all]
     eval_times = get_stage_eval_times(event_times, n_grid=n_eval_grid)
     base = {
@@ -487,23 +516,18 @@ def _stage_metrics(
     if eval_times is None:
         return base
 
-    eval_tmax = float(eval_times[-1])
     nd_time = float(np.median(event_times))
-    eval_keep = stage_end_all >= eval_tmax
     train_stage = train_reference["stage_id"] == stage_id
-    train_keep = train_stage & (
-        train_reference["stage_end_horizon"] >= eval_tmax
-    )
-    times = times_all[eval_keep]
-    events = events_all[eval_keep]
-    hazards = hazards_all[eval_keep]
-    train_times = train_reference["time"][train_keep]
-    train_events = train_reference["event"][train_keep]
+    times = times_all
+    events = events_all
+    hazards = hazards_all
+    train_times = train_reference["time"][train_stage]
+    train_events = train_reference["event"][train_stage]
     if len(times) < 2 or len(train_times) < 2:
         return base
 
     max_observed = min(float(np.max(train_times)), float(np.max(times)))
-    if eval_tmax >= max_observed:
+    if eval_times[-1] >= max_observed:
         eval_times = eval_times[eval_times < max_observed]
         if len(eval_times) < 2:
             return base

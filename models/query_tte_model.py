@@ -70,6 +70,7 @@ class TaskQueryPiecewiseSurvivalModel(PreTrainedModel):
             times=times,
             numeric_values=numeric_values,
             numeric_mask=numeric_mask,
+            numeric_feature_ids=self.encoder.numeric_feature_ids(item_ids, unit_ids),
             seq_mask=seq_mask,
             type_ids=type_ids,
             return_mask=True,

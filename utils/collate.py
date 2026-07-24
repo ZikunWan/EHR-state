@@ -1,3 +1,5 @@
+import ast
+
 import torch
 from typing import List, Dict, Any, Optional
 import pandas as pd
@@ -426,6 +428,21 @@ def create_multi_query_classifier_collate_fn(
 
 
 def parse_classification_label(raw_label, label_map=None):
+    if isinstance(raw_label, str) and raw_label.strip().startswith("["):
+        raw_label = ast.literal_eval(raw_label)
+    if isinstance(raw_label, (list, tuple, set)):
+        if label_map is None:
+            return torch.as_tensor(list(raw_label), dtype=torch.long)
+        target = torch.zeros(len(label_map), dtype=torch.float)
+        for value in raw_label:
+            if value in label_map:
+                class_index = label_map[value]
+            elif str(value) in label_map:
+                class_index = label_map[str(value)]
+            else:
+                class_index = int(value)
+            target[int(class_index)] = 1.0
+        return target
     if isinstance(raw_label, torch.Tensor):
         if raw_label.numel() == 1:
             return int(raw_label.item())
@@ -496,7 +513,10 @@ def create_query_classifier_collate_fn(
             else:
                 tensors["query_embeds"] = query_tensor.unsqueeze(0).expand(batch_size, -1, -1).clone()
                 tensors["query_mask"] = torch.ones(batch_size, query_tensor.size(0), dtype=torch.float32)
-        tensors["labels"] = torch.tensor(labels, dtype=torch.long)
+        if isinstance(labels[0], torch.Tensor):
+            tensors["labels"] = torch.stack(labels)
+        else:
+            tensors["labels"] = torch.tensor(labels, dtype=torch.long)
         if include_metadata:
             tensors["metadata"] = metadata
         return tensors

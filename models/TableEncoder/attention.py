@@ -84,18 +84,22 @@ class FlashAttention(nn.Module):
             # SDPA bool masks use True = attend and False = ignore.
             attn_mask = attn_mask.bool()
 
-        # Flash Attention has a known backward bug for short sequences. Use mem_efficient backend which:
-        #   - avoids Flash Attention's small-seq backward CUDA bug
-        #   - uses O(N) memory unlike the math backend
+        # Flash Attention has a known backward bug for short sequences. Prefer
+        # the efficient backend and allow the math fallback, which is small here.
         if seq_len < 64:
-            ctx = sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION])
-            
+            ctx = sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+            short_mask = attn_mask
+            if causal:
+                causal_mask = torch.ones(
+                    seq_len, seq_len, dtype=torch.bool, device=x.device
+                ).tril().view(1, 1, seq_len, seq_len)
+                short_mask = causal_mask if short_mask is None else short_mask & causal_mask
             with ctx:
                 x = F.scaled_dot_product_attention(
                     q, k, v,
-                    attn_mask=attn_mask,
+                    attn_mask=short_mask,
                     dropout_p=self.attn_drop_prob if self.training else 0.0,
-                    is_causal=causal,
+                    is_causal=False,
                 )
         else:
             # seq_len >= 64: let SDPA auto-select Flash Attention (O(N) memory)

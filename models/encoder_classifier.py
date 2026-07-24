@@ -23,9 +23,15 @@ class QueryClassifierOutput(ModelOutput):
 
 
 class QueryClassificationHead(nn.Module):
-    def __init__(self, query_dim: int, hidden_dim: Optional[int] = None):
+    def __init__(
+        self,
+        query_dim: int,
+        hidden_dim: Optional[int] = None,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         hidden_dim = int(hidden_dim or query_dim)
+        self.dropout = nn.Dropout(dropout)
         self.net = nn.Sequential(
             nn.LayerNorm(query_dim),
             nn.Linear(query_dim, hidden_dim),
@@ -34,7 +40,11 @@ class QueryClassificationHead(nn.Module):
         )
 
     def forward(self, query_states: torch.Tensor) -> torch.Tensor:
-        logits = self.net(query_states).squeeze(-1)
+        hidden_states = self.net[0](query_states)
+        hidden_states = self.net[1](hidden_states)
+        hidden_states = self.net[2](hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        logits = self.net[3](hidden_states).squeeze(-1)
         return logits
 
 
@@ -42,6 +52,7 @@ def query_classification_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     query_mask: Optional[torch.Tensor] = None,
+    pos_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     labels = labels.to(logits.device)
     if query_mask is not None:
@@ -56,6 +67,7 @@ def query_classification_loss(
             return F.binary_cross_entropy_with_logits(
                 logits.float()[valid_mask],
                 labels.float()[valid_mask],
+                pos_weight=pos_weight,
             )
         return logits.sum() * 0.0
 
@@ -63,6 +75,7 @@ def query_classification_loss(
         return F.binary_cross_entropy_with_logits(
             logits.reshape(-1).float(),
             labels.reshape(-1).float(),
+            pos_weight=pos_weight,
         )
 
     return F.cross_entropy(logits.float(), labels.long())
@@ -83,7 +96,14 @@ class EncoderClassifierModel(PreTrainedModel):
         self.adapter = QFormerAdapter(config)
         self.text_embedding = nn.Embedding.from_pretrained(embedding_matrix, freeze=True)
         self.query_head = QueryCrossAttentionHead(config, query_dim=query_dim)
-        self.classifier = QueryClassificationHead(query_dim=query_dim)
+        self.classifier = QueryClassificationHead(
+            query_dim=query_dim,
+            dropout=float(getattr(config, "classifier_dropout", 0.0)),
+        )
+        self.register_buffer(
+            "binary_pos_weight",
+            torch.tensor(float(getattr(config, "pos_weight", 1.0))),
+        )
         self.post_init()
 
     def _init_weights(self, module):
@@ -123,11 +143,32 @@ class EncoderClassifierModel(PreTrainedModel):
             seq_mask=seq_mask,
             type_ids=type_ids,
         )
-        logits = self.classifier(query_states)
+        loss_query_mask = query_mask
+        if (
+            int(getattr(self.config, "num_classes", 0)) == 1
+            and query_states.dim() == 3
+            and query_states.size(1) == 2
+        ):
+            if query_mask is None:
+                summary_mask = query_states.new_ones(query_states.shape[:2])
+            else:
+                summary_mask = query_mask[:, :2].to(query_states.dtype)
+            primary_states = (
+                query_states[:, :2] * summary_mask.unsqueeze(-1)
+            ).sum(dim=1) / summary_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+            logits = self.classifier(primary_states)
+            loss_query_mask = None
+        else:
+            logits = self.classifier(query_states)
 
         loss = None
         if labels is not None:
-            loss = query_classification_loss(logits, labels, query_mask=query_mask)
+            loss = query_classification_loss(
+                logits,
+                labels,
+                query_mask=loss_query_mask,
+                pos_weight=self.binary_pos_weight,
+            )
 
         return QueryClassifierOutput(loss=loss, logits=logits, query_states=query_states)
 
@@ -150,6 +191,7 @@ class EncoderClassifierModel(PreTrainedModel):
             times=times,
             numeric_values=numeric_values,
             numeric_mask=numeric_mask,
+            numeric_feature_ids=self.encoder.numeric_feature_ids(item_ids, unit_ids),
             seq_mask=seq_mask,
             type_ids=type_ids,
             return_mask=True,

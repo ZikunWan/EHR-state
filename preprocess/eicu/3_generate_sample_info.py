@@ -32,6 +32,7 @@ Next Step:
 ==============================================================================
 """
 import os
+import ast
 import argparse
 import pandas as pd
 import numpy as np
@@ -178,9 +179,10 @@ def generate_sample_info(
             elif task in ['creatinine', 'bilirubin', 'platelets', 'wbc', 'final_acuity', 'imminent_discharge']:
                 label = int(label)
             elif task == 'diagnosis':
-                # Multi-label - keep as is or convert to list
                 if isinstance(label, str):
-                    label = eval(label) if label.startswith('[') else [label]
+                    label = ast.literal_eval(label) if label.startswith('[') else [label]
+                if not label:
+                    continue
             
             sample = {
                 'icustay_id': icustay_id,

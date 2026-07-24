@@ -31,24 +31,6 @@ TASK_INFO = {
             "yes": "The patient will be transferred to the ICU during the visit.",
         },
     },
-    "Time_to_Hospital_Discharge": {
-        "metric": "survival",
-        "task_type": "time_to_event",
-        "instruction": "Given the sequence of events that have occurred in a hospital, estimate the time to hospital discharge.",
-        "candidate_prompts": {},
-    },
-    "Time_to_Hospital_Readmission": {
-        "metric": "survival",
-        "task_type": "time_to_event",
-        "instruction": "Given the sequence of events that have occurred in a hospital, estimate the time to hospital readmission after discharge.",
-        "candidate_prompts": {},
-    },
-    "Time_to_ICU_Transfer": {
-        "metric": "survival",
-        "task_type": "time_to_event",
-        "instruction": "Given the sequence of events that have occurred in a hospital, estimate the time to ICU transfer during the visit.",
-        "candidate_prompts": {},
-    },
     "lab_anemia": {
         "metric": "auroc",
         "task_type": "multi_class_classification",
